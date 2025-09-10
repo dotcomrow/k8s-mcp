@@ -71,10 +71,10 @@ spec:
         kubernetes:
           serviceAccountRef:
             name: mcp-server
-          role: mcp-external-secrets   # this role/policy is created by the job below
+          role: mcp-external-secrets
           mountPath: kubernetes
 ---
-# Pull vaultadmin static admin secrets from KV: secret/vaultadmin
+# Pull vaultadmin static admin secrets from KV: secret/vaultadmin (ONLY user/pass)
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -97,18 +97,9 @@ spec:
       remoteRef:
         key: vaultadmin
         property: password
-    - secretKey: host
-      remoteRef:
-        key: yugabyte/config
-        property: host
-        optional: true
-    - secretKey: port
-      remoteRef:
-        key: yugabyte/config
-        property: port
-        optional: true
 ---
 # Runtime STATIC username + rotating password from Vault static-creds
+# Host/port are now LITERALS in the template (no Vault dependency)
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -125,13 +116,13 @@ spec:
     template:
       engineVersion: v2
       data:
-        DATABASE_URL: >-
-          postgres://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/mcp?sslmode=disable
-        DB_USERNAME: "{{ .username }}"   # should resolve to 'mcp_app'
-        DB_PASSWORD: "{{ .password }}"
-        DB_HOST: "{{ .host }}"
-        DB_PORT: "{{ .port }}"
+        DB_HOST: "yb-tserver-service.yugabyte.svc.cluster.local"
+        DB_PORT: "5433"
         DB_NAME: "mcp"
+        DB_USERNAME: "{{ .username }}"   # should be 'mcp_app'
+        DB_PASSWORD: "{{ .password }}"
+        DATABASE_URL: >-
+          postgres://{{ .username }}:{{ .password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/mcp?sslmode=disable
   data:
     - secretKey: username
       remoteRef:
@@ -141,16 +132,8 @@ spec:
       remoteRef:
         key: yugabyte-db/static-creds/mcp-app
         property: password
-    - secretKey: host
-      remoteRef:
-        key: yugabyte/config
-        property: host
-    - secretKey: port
-      remoteRef:
-        key: yugabyte/config
-        property: port
 ---
-# Optional API keys (now relative to KV mount "secret/")
+# Optional API keys (still reads from KV mount "secret/")
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -222,7 +205,7 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =========================================
-# Create Vault policy+role for ESO (so it can read Vault and make Secrets)
+# Create Vault policy+role for ESO (reads only the paths we use)
 # =========================================
 apiVersion: batch/v1
 kind: Job
@@ -262,7 +245,6 @@ spec:
               vault policy write "mcp-external-secrets" - <<'EOF'
               # ESO needs read on all paths referenced by ExternalSecrets in mcp ns
               path "secret/data/vaultadmin"                 { capabilities = ["read"] }
-              path "secret/data/yugabyte/config"            { capabilities = ["read"] }
               path "yugabyte-db/static-creds/mcp-app"       { capabilities = ["read"] }
               path "secret/data/open_ai_key"                { capabilities = ["read"] }
               EOF
@@ -463,17 +445,9 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
           env:
             - name: YB_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: host
-                  optional: true
+              value: "yb-tserver-service.yugabyte.svc.cluster.local"
             - name: YB_PORT
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: port
-                  optional: true
+              value: "5433"
             - name: YB_USER
               valueFrom:
                 secretKeyRef:
@@ -487,8 +461,8 @@ spec:
           command: ["/bin/sh","-c"]
           args:
             - |
-              H=${YB_HOST:-"yb-tserver-service.yugabyte.svc.cluster.local"}
-              P=${YB_PORT:-"5433"}
+              H="${YB_HOST}"
+              P="${YB_PORT}"
               export PGPASSWORD="${YB_PASS}"
               echo "Checking DB 'mcp' presence..."
               psql -h "$H" -p "$P" -U "$YB_USER" -d yugabyte -tc "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1 || \
@@ -515,9 +489,19 @@ spec:
       serviceAccountName: mcp-server
       nodeSelector:
         dedicated: srvr-node
+      initContainers:
+        - name: wait-for-yb-vaultadmin
+          image: bitnami/kubectl:1.31
+          command: ["sh","-c"]
+          args:
+            - |
+              echo "Waiting for Secret yb-vaultadmin..."
+              until kubectl -n mcp get secret yb-vaultadmin >/dev/null 2>&1; do sleep 2; done
+              echo "Found yb-vaultadmin."
       containers:
         - name: mcp
-          image: ghcr.io/modelcontextprotocol/servers/kubernetes:latest
+          image: ghcr.io/containers/kubernetes-mcp-server:v0.0.49
+          args: ["--port=8080", "--log-level=4"]
           imagePullPolicy: IfNotPresent
           env:
             - name: MCP_SERVER_NAME
@@ -572,14 +556,12 @@ spec:
             - name: http
               containerPort: 8080
           readinessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20
