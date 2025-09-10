@@ -14,6 +14,7 @@ metadata:
   name: mcp-server
   namespace: mcp
 ---
+# RBAC so MCP can manage the local cluster (trim later for least-privilege)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -54,7 +55,7 @@ subjects:
     name: mcp-server
     namespace: mcp
 ---
-# ========= External Secrets: SecretStore + ExternalSecrets =========
+# SecretStore to Vault (ESO) - KV v2 mount at "secret"
 apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
@@ -64,7 +65,8 @@ spec:
   provider:
     vault:
       server: https://vault.app.suncoast.systems
-      # caBundle: <BASE64_CA>   # uncomment if Vault uses a private CA for the FQDN above
+      # If Vault uses a private CA, uncomment and paste base64-encoded CA:
+      # caBundle: <BASE64_CA>
       path: secret
       version: v2
       auth:
@@ -73,8 +75,10 @@ spec:
             name: mcp-server
           role: mcp-external-secrets
           mountPath: kubernetes
+          # IMPORTANT: match Vault role bound_audiences
           audience: vault
 ---
+# Pull vaultadmin static admin secrets from KV: secret/vaultadmin (ONLY user/pass)
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -98,6 +102,8 @@ spec:
         key: vaultadmin
         property: password
 ---
+# Runtime STATIC username + rotating password from Vault static-creds
+# Host/port are LITERALS (no Vault dependency)
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -117,7 +123,7 @@ spec:
         DB_HOST: "yb-tserver-service.yugabyte.svc.cluster.local"
         DB_PORT: "5433"
         DB_NAME: "mcp"
-        DB_USERNAME: "{{ .username }}"
+        DB_USERNAME: "{{ .username }}"   # should be 'mcp_app'
         DB_PASSWORD: "{{ .password }}"
         DATABASE_URL: >-
           postgres://{{ .username }}:{{ .password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/mcp?sslmode=disable
@@ -131,6 +137,7 @@ spec:
         key: yugabyte-db/static-creds/mcp-app
         property: password
 ---
+# Optional API keys (still reads from KV mount "secret/")
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -160,21 +167,9 @@ data:
   MCP_SERVER_NAME: "mcp-k8s"
   MCP_LOG_LEVEL: "info"
 ---
-# ========= Vault bootstrap helpers (run in vault ns) =========
-# Allow the Vault pod's SA to perform TokenReview (Vault uses its own SA token)
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: vault-auth-delegator
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: system:auth-delegator
-subjects:
-  - kind: ServiceAccount
-    name: vault
-    namespace: vault
----
+# ===============================
+# Copy Vault root token to mcp ns
+# ===============================
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -193,24 +188,29 @@ spec:
         - name: copy-secret
           image: alpine/k8s:1.31.4
           command: ["/bin/sh","-c"]
-          args: |
-            set -eu
-            NS_SRC="vault"
-            NS_DST="mcp"
-            SRC_NAME="vault-root-token"
-            DST_NAME="vault-root-token"
-            if ! kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" >/dev/null 2>&1; then
-              echo "Source secret ${NS_SRC}/${SRC_NAME} not found"; exit 1
-            fi
-            kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" -o json \
-              | jq '.metadata.namespace="'"${NS_DST}"'"|.metadata.name="'"${DST_NAME}"'"|del(.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.ownerReferences)' \
-              | kubectl apply -f -
-            echo "Copied."
+          args:
+            - |
+              set -eu
+              NS_SRC="vault"
+              NS_DST="mcp"
+              SRC_NAME="vault-root-token"
+              DST_NAME="vault-root-token"
+
+              echo "🔁 Copying ${SRC_NAME} from ${NS_SRC} to ${NS_DST}/${DST_NAME}..."
+              if ! kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" >/dev/null 2>&1; then
+                echo "❌ Source secret ${NS_SRC}/${SRC_NAME} not found"; exit 1
+              fi
+              kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" -o json \
+                | jq '.metadata.namespace="'"${NS_DST}"'"|.metadata.name="'"${DST_NAME}"'"|del(.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.ownerReferences)' \
+                | kubectl apply -f -
+              echo "✅ Copied."
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
-# Configure Vault auth/kubernetes for ESO (no stored reviewer token; use Vault SA)
+# =========================================
+# Configure Vault auth/kubernetes + role for ESO
+# =========================================
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -233,39 +233,57 @@ spec:
         - name: setup-eso-role
           image: hashicorp/vault:1.15.4
           command: ["/bin/sh","-c"]
-          args: |
-            set -eu
-            export PATH="$PATH:/vault-bin"
-            export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
-            while [ ! -f /vault-token/VAULT_TOKEN ]; do sleep 2; done
-            export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
-            apk add --no-cache jq >/dev/null
+          args:
+            - |
+              set -eu
+              export PATH="$PATH:/vault-bin"
+              export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
 
-            vault auth list -format=json | jq -e 'has("kubernetes/")' >/dev/null 2>&1 || vault auth enable kubernetes
+              while [ ! -f /vault-token/VAULT_TOKEN ]; do sleep 2; done
+              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
 
-            KUBE_HOST="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-            CA_FILE="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              # Utilities
+              apk add --no-cache jq >/dev/null
 
-            vault write auth/kubernetes/config \
-              kubernetes_host="$KUBE_HOST" \
-              kubernetes_ca_cert=@"$CA_FILE" \
-              token_reviewer_jwt="" \
-              disable_iss_validation=true
+              # Enable k8s auth if missing
+              vault auth list -format=json | jq -e 'has("kubernetes/")' >/dev/null 2>&1 || vault auth enable kubernetes
 
-            vault policy write "mcp-external-secrets" - <<'EOF'
-            path "secret/data/vaultadmin"                 { capabilities = ["read"] }
-            path "yugabyte-db/static-creds/mcp-app"       { capabilities = ["read"] }
-            path "secret/data/open_ai_key"                { capabilities = ["read"] }
-            EOF
+              # K8s connection params for TokenReview
+              KUBE_HOST="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+              TOKEN_REVIEWER_JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              CA_FILE="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
-            vault write auth/kubernetes/role/mcp-external-secrets \
-              bound_service_account_names="mcp-server" \
-              bound_service_account_namespaces="mcp" \
-              bound_audiences="vault" \
-              policies="mcp-external-secrets" \
-              ttl="24h"
+              # >>> Pin issuer to match your JWT <<<
+              ISSUER="https://kubernetes.default.svc.internal.lan"
 
-            echo "Configured ESO role mcp-external-secrets."
+              echo "Writing auth/kubernetes/config with explicit issuer: ${ISSUER}"
+              vault write auth/kubernetes/config \
+                token_reviewer_jwt="$TOKEN_REVIEWER_JWT" \
+                kubernetes_host="$KUBE_HOST" \
+                kubernetes_ca_cert=@"$CA_FILE" \
+                issuer="$ISSUER"
+
+              # Policy ESO needs (same as before)
+              vault policy write "mcp-external-secrets" - <<'EOF'
+              path "secret/data/vaultadmin"                 { capabilities = ["read"] }
+              path "yugabyte-db/static-creds/mcp-app"       { capabilities = ["read"] }
+              path "secret/data/open_ai_key"                { capabilities = ["read"] }
+              EOF
+
+              # Role for ESO: SA/NS + audience=vault
+              vault write auth/kubernetes/role/mcp-external-secrets \
+                bound_service_account_names="mcp-server" \
+                bound_service_account_namespaces="mcp" \
+                bound_audiences="vault" \
+                policies="mcp-external-secrets" \
+                ttl="24h"
+
+              echo "==== Current config ===="
+              vault read -format=json auth/kubernetes/config | jq .
+              echo "==== Current role ======"
+              vault read -format=json auth/kubernetes/role/mcp-external-secrets | jq .
+
+              echo "✅ auth/kubernetes configured with explicit issuer."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -274,7 +292,10 @@ spec:
             requests: { cpu: "50m",  memory: "64Mi" }
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
-# Yugabyte + Vault database engine bootstrap (static user with rotating password)
+# =========================================
+# Yugabyte + Vault database engine bootstrap
+# STATIC username (mcp_app) with rotating password
+# =========================================
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -297,102 +318,115 @@ spec:
         - name: setup-role
           image: hashicorp/vault:1.15.4
           command: ["/bin/sh","-c"]
-          args: |
-            set -eu
-            PGHOST="${PGHOST:-yb-tserver-service.yugabyte.svc.cluster.local}"
-            PGPORT="${PGPORT:-5433}"
-            DB="mcp"
-            BASE_ROLE="mcp"
-            OWNER_ROLE="mcp_app"
-            VAULTADMIN_USER="vaultadmin"
+          args:
+            - |
+              set -eu
 
-            apk add --no-cache postgresql15-client jq netcat-openbsd curl
-            export PATH="$PATH:/vault-bin"
-            export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
-            while [ ! -f /vault-token/VAULT_TOKEN ]; do sleep 2; done
-            export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
+              PGHOST="${PGHOST:-yb-tserver-service.yugabyte.svc.cluster.local}"
+              PGPORT="${PGPORT:-5433}"
+              DB="mcp"
+              BASE_ROLE="mcp"         # NOLOGIN base role
+              OWNER_ROLE="mcp_app"    # STATIC LOGIN role used by the app
+              VAULTADMIN_USER="vaultadmin"
 
-            if ! vault secrets list -format=json | jq -e '."secret/".type=="kv" and ."secret/".options.version=="2"' >/dev/null 2>&1; then
-              if vault secrets list -format=json | jq -e 'has("secret/")' >/dev/null 2>&1; then
-                echo "'secret/' exists but is not KVv2; abort."; exit 1
-              else
-                vault secrets enable -path=secret -version=2 kv
+              apk add --no-cache postgresql15-client jq netcat-openbsd curl
+
+              export PATH="$PATH:/vault-bin"
+              export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
+
+              while [ ! -f /vault-token/VAULT_TOKEN ]; do
+                echo "🔁 Waiting for Vault token file..."
+                sleep 2
+              done
+              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
+
+              # ensure KV v2 at secret/
+              if ! vault secrets list -format=json | jq -e '."secret/".type=="kv" and ."secret/".options.version=="2"' >/dev/null 2>&1; then
+                if vault secrets list -format=json | jq -e 'has("secret/")' >/dev/null 2>&1; then
+                  echo "❌ 'secret/' exists but is not KVv2; please migrate manually."; exit 1
+                else
+                  vault secrets enable -path=secret -version=2 kv
+                fi
               fi
-            fi
 
-            VAULTADMIN_PASS="$(vault kv get -format=json secret/${VAULTADMIN_USER} 2>/dev/null | jq -r '.data.data.password // .data.data.value // empty' || true)"
-            if [ -z "${VAULTADMIN_PASS:-}" ] || [ "${VAULTADMIN_PASS}" = "null" ]; then
-              echo "secret/${VAULTADMIN_USER} missing 'password'"; exit 1
-            fi
-            export PGPASSWORD="$VAULTADMIN_PASS"
+              # fetch vaultadmin password from KV
+              VAULTADMIN_PASS="$(vault kv get -format=json secret/${VAULTADMIN_USER} 2>/dev/null | jq -r '.data.data.password // .data.data.value // empty' || true)"
+              if [ -z "${VAULTADMIN_PASS:-}" ] || [ "${VAULTADMIN_PASS}" = "null" ]; then
+                echo "❌ secret/${VAULTADMIN_USER} missing 'password'"; exit 1
+              fi
+              export PGPASSWORD="$VAULTADMIN_PASS"
 
-            until getent hosts "$PGHOST" >/dev/null 2>&1; do sleep 3; done
-            until nc -z -w1 "$PGHOST" "$PGPORT"; do sleep 3; done
+              # wait for DB
+              until getent hosts "$PGHOST" >/dev/null 2>&1; do sleep 3; done
+              until nc -z -w1 "$PGHOST" "$PGPORT"; do sleep 3; done
 
-            DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'" || true)"
-            if [ "${DB_EXISTS}" != "1" ]; then
-              createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$DB"
-            fi
+              # create DB if missing
+              DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'" || true)"
+              if [ "${DB_EXISTS}" != "1" ]; then
+                createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$DB"
+              fi
 
-            psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$DB" <<EOSQL
-            DO \$\$
-            BEGIN
-              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${BASE_ROLE}') THEN
-                CREATE ROLE ${BASE_ROLE} NOLOGIN INHERIT;
-              END IF;
-              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${OWNER_ROLE}') THEN
-                CREATE ROLE ${OWNER_ROLE} LOGIN INHERIT;
-              END IF;
-            END
-            \$\$;
+              # roles + schema + privileges
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$DB" <<EOSQL
+              DO \$\$
+              BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${BASE_ROLE}') THEN
+                  CREATE ROLE ${BASE_ROLE} NOLOGIN INHERIT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${OWNER_ROLE}') THEN
+                  CREATE ROLE ${OWNER_ROLE} LOGIN INHERIT;
+                END IF;
+              END
+              \$\$;
 
-            CREATE SCHEMA IF NOT EXISTS mcp AUTHORIZATION ${VAULTADMIN_USER};
-            ALTER ROLE ${OWNER_ROLE} SET search_path = mcp;
+              CREATE SCHEMA IF NOT EXISTS mcp AUTHORIZATION ${VAULTADMIN_USER};
+              ALTER ROLE ${OWNER_ROLE} SET search_path = mcp;
 
-            GRANT USAGE, CREATE ON SCHEMA mcp TO ${BASE_ROLE};
-            GRANT ${BASE_ROLE} TO ${OWNER_ROLE};
-            GRANT CONNECT ON DATABASE ${DB} TO ${OWNER_ROLE};
+              GRANT USAGE, CREATE ON SCHEMA mcp TO ${BASE_ROLE};
+              GRANT ${BASE_ROLE} TO ${OWNER_ROLE};
+              GRANT CONNECT ON DATABASE ${DB} TO ${OWNER_ROLE};
 
-            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA mcp TO ${BASE_ROLE};
-            GRANT USAGE, SELECT                     ON ALL SEQUENCES IN SCHEMA mcp TO ${BASE_ROLE};
-            ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES   TO ${BASE_ROLE};
-            ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT USAGE, SELECT                ON SEQUENCES TO ${BASE_ROLE};
+              GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA mcp TO ${BASE_ROLE};
+              GRANT USAGE, SELECT                     ON ALL SEQUENCES IN SCHEMA mcp TO ${BASE_ROLE};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES   TO ${BASE_ROLE};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT USAGE, SELECT                ON SEQUENCES TO ${BASE_ROLE};
 
-            GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp TO ${VAULTADMIN_USER};
-            GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp TO ${VAULTADMIN_USER};
-            ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON TABLES    TO ${VAULTADMIN_USER};
-            ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON SEQUENCES TO ${VAULTADMIN_USER};
-            EOSQL
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp TO ${VAULTADMIN_USER};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp TO ${VAULTADMIN_USER};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON TABLES    TO ${VAULTADMIN_USER};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON SEQUENCES TO ${VAULTADMIN_USER};
+              EOSQL
 
-            if ! vault secrets list -format=json | jq -e 'has("yugabyte-db/")' >/dev/null 2>&1; then
-              vault secrets enable -path=yugabyte-db database
-            fi
+              # database engine mount
+              if ! vault secrets list -format=json | jq -e 'has("yugabyte-db/")' >/dev/null 2>&1; then
+                vault secrets enable -path=yugabyte-db database
+              fi
 
-            vault write yugabyte-db/static-roles/mcp-app \
-              db_name="yugabyte" \
-              username="${OWNER_ROLE}" \
-              rotation_statements="ALTER ROLE ${OWNER_ROLE} WITH PASSWORD '{{password}}';" \
-              rotation_period="720h"
+              vault write yugabyte-db/static-roles/mcp-app \
+                db_name="yugabyte" \
+                username="${OWNER_ROLE}" \
+                rotation_statements="ALTER ROLE ${OWNER_ROLE} WITH PASSWORD '{{password}}';" \
+                rotation_period="720h"
 
-            vault policy write "mcp" - <<'EOF'
-            path "yugabyte-db/static-creds/mcp-app" { capabilities = ["read"] }
-            path "secret/data/vaultadmin"           { capabilities = ["read"] }
-            path "secret/data/mcp/*"                { capabilities = ["read"] }
-            EOF
+              vault policy write "mcp" - <<'EOF'
+              path "yugabyte-db/static-creds/mcp-app" { capabilities = ["read"] }
+              path "secret/data/vaultadmin"           { capabilities = ["read"] }
+              path "secret/data/mcp/*"                { capabilities = ["read"] }
+              EOF
 
-            vault write auth/kubernetes/role/mcp \
-              bound_service_account_names="mcp-server" \
-              bound_service_account_namespaces="mcp" \
-              bound_audiences="vault" \
-              policies="mcp" \
-              ttl="48h"
+              vault write auth/kubernetes/role/mcp \
+                bound_service_account_names="mcp-server" \
+                bound_service_account_namespaces="mcp" \
+                bound_audiences="vault" \
+                policies="mcp" \
+                ttl="48h"
 
-            CREDS_JSON="$(vault read -format=json yugabyte-db/static-creds/mcp-app)"
-            APP_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
-            APP_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"
-            export PGPASSWORD="$APP_PASS"
-            psql -h "$PGHOST" -p "$PGPORT" -U "$APP_USER" -d "$DB" -c "SELECT current_user, current_schema();" || exit 1
-            echo "MCP DB + Vault static role ready."
+              CREDS_JSON="$(vault read -format=json yugabyte-db/static-creds/mcp-app)"
+              APP_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
+              APP_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"
+              export PGPASSWORD="$APP_PASS"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$APP_USER" -d "$DB" -c "SELECT current_user, current_schema();"
+              echo "🎉 MCP DB + Vault static role ready."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -401,7 +435,7 @@ spec:
             requests: { cpu: "50m",  memory: "64Mi" }
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
-# ========= Optional: ensure DB exists from app side =========
+# Minimal DB presence check from app ns (optional safety)
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -438,16 +472,16 @@ spec:
                   name: yb-vaultadmin
                   key: password
           command: ["/bin/sh","-c"]
-          args: |
-            set -eu
-            H="${YB_HOST}"
-            P="${YB_PORT}"
-            export PGPASSWORD="${YB_PASS}"
-            psql -h "$H" -p "$P" -U "$YB_USER" -d yugabyte -tc "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1 || \
-              psql -h "$H" -p "$P" -U "$YB_USER" -d postgres -c "CREATE DATABASE mcp"
-            echo "DB present."
+          args:
+            - |
+              H="${YB_HOST}"
+              P="${YB_PORT}"
+              export PGPASSWORD="${YB_PASS}"
+              echo "Checking DB 'mcp' presence..."
+              psql -h "$H" -p "$P" -U "$YB_USER" -d yugabyte -tc "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1 || \
+                psql -h "$H" -p "$P" -U "$YB_USER" -d postgres -c "CREATE DATABASE mcp"
+              echo "OK."
 ---
-# ========= MCP server =========
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -472,10 +506,11 @@ spec:
         - name: wait-for-yb-vaultadmin
           image: bitnami/kubectl:1.31
           command: ["sh","-c"]
-          args: |
-            echo "Waiting for Secret yb-vaultadmin..."
-            until kubectl -n mcp get secret yb-vaultadmin >/dev/null 2>&1; do sleep 2; done
-            echo "Found yb-vaultadmin."
+          args:
+            - |
+              echo "Waiting for Secret yb-vaultadmin..."
+              until kubectl -n mcp get secret yb-vaultadmin >/dev/null 2>&1; do sleep 2; done
+              echo "Found yb-vaultadmin."
       containers:
         - name: mcp
           image: ghcr.io/containers/kubernetes-mcp-server:v0.0.49
