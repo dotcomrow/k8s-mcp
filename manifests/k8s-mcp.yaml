@@ -5,7 +5,6 @@ metadata:
   annotations:
     linkerd.io/inject: disabled
     field.cattle.io/projectId: local:applications
-    # If you keep strict node placement on infra apps, keep your label:
     scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
     config.linkerd.io/opaque-ports: "5433,8200,443"
 ---
@@ -56,7 +55,7 @@ subjects:
     name: mcp-server
     namespace: mcp
 ---
-# SecretStore to Vault (ESO)
+# SecretStore to Vault (ESO) - KV v2 mount at "secret"
 apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
@@ -65,24 +64,18 @@ metadata:
 spec:
   provider:
     vault:
-      # Vault base URL (use your internal/service address or external if you prefer)
       server: https://vault.app.suncoast.systems
-      # Mount path of your KV engine (e.g., "secret" or "kv")
       path: secret
-      # KV engine version
       version: v2
       auth:
         kubernetes:
-          # Name of the SA that ESO will use in the *mcp* namespace
           serviceAccountRef:
-            name: external-secrets
-          # Name of the Vault K8s auth role that maps this SA/namespace
-          role: external-secrets
-          # Path where Vault's K8s auth method is enabled (default often "kubernetes")
+            name: mcp-server
+          role: mcp-external-secrets
           mountPath: kubernetes
 ---
-# Pull vaultadmin (static admin) — used only by bootstrap Job
-apiVersion: external-secrets.io/v1beta1
+# Pull vaultadmin static admin secrets from KV: secret/vaultadmin
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: yb-vaultadmin
@@ -98,11 +91,11 @@ spec:
   data:
     - secretKey: username
       remoteRef:
-        key: yugabyte-db/static-creds/vaultadmin
+        key: vaultadmin
         property: username
     - secretKey: password
       remoteRef:
-        key: yugabyte-db/static-creds/vaultadmin
+        key: vaultadmin
         property: password
     - secretKey: host
       remoteRef:
@@ -116,7 +109,7 @@ spec:
         optional: true
 ---
 # Runtime STATIC username + rotating password from Vault static-creds
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: mcp-db-static
@@ -157,8 +150,8 @@ spec:
         key: yugabyte/config
         property: port
 ---
-# Optional API keys (extend as needed)
-apiVersion: external-secrets.io/v1beta1
+# Optional API keys (now relative to KV mount "secret/")
+apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
   name: mcp-apis
@@ -174,7 +167,7 @@ spec:
   data:
     - secretKey: OPENAI_API_KEY
       remoteRef:
-        key: secret/open_ai_key
+        key: open_ai_key
         property: OPENAI_API_KEY
         optional: true
 ---
@@ -297,7 +290,7 @@ spec:
               export PGPASSWORD="$VAULTADMIN_PASS"
 
               # wait for DB
-              until getent hosts "$PGHOST" >/dev/null 2>&1; do echo "🔄 Waiting for DNS for $PGHOST..."; sleep 3; end
+              until getent hosts "$PGHOST" >/dev/null 2>&1; do echo "🔄 Waiting for DNS for $PGHOST..."; sleep 3; done
               until nc -z -w1 "$PGHOST" "$PGPORT"; do echo "⏳ Waiting for DB $PGHOST:$PGPORT..."; sleep 3; done
               echo "✅ Yugabyte reachable"
 
