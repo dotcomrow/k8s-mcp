@@ -57,7 +57,7 @@ subjects:
     namespace: mcp
 ---
 # SecretStore to Vault (ESO)
-apiVersion: external-secrets.io/v1beta1
+apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
   name: vault
@@ -65,15 +65,21 @@ metadata:
 spec:
   provider:
     vault:
+      # Vault base URL (use your internal/service address or external if you prefer)
       server: https://vault.app.suncoast.systems
-      path: ""
+      # Mount path of your KV engine (e.g., "secret" or "kv")
+      path: secret
+      # KV engine version
       version: v2
       auth:
         kubernetes:
-          mountPath: /v1/auth/kubernetes
-          role: mcp-external-secrets
+          # Name of the SA that ESO will use in the *mcp* namespace
           serviceAccountRef:
-            name: mcp-server
+            name: external-secrets
+          # Name of the Vault K8s auth role that maps this SA/namespace
+          role: external-secrets
+          # Path where Vault's K8s auth method is enabled (default often "kubernetes")
+          mountPath: kubernetes
 ---
 # Pull vaultadmin (static admin) — used only by bootstrap Job
 apiVersion: external-secrets.io/v1beta1
