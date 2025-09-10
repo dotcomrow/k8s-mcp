@@ -71,7 +71,7 @@ spec:
         kubernetes:
           serviceAccountRef:
             name: mcp-server
-          role: mcp-external-secrets   # this role/policy is created by the job below
+          role: mcp-external-secrets
           mountPath: kubernetes
 ---
 # Pull vaultadmin static admin secrets from KV: secret/vaultadmin
@@ -219,68 +219,6 @@ spec:
               echo "✅ Copied."
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
----
-# =========================================
-# Create Vault policy+role for ESO (so it can read Vault and make Secrets)
-# =========================================
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mcp-eso-vault-role
-  namespace: vault
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      annotations:
-        linkerd.io/inject: "disabled"
-    spec:
-      restartPolicy: Never
-      serviceAccountName: default
-      volumes:
-        - name: root-token
-          secret:
-            secretName: vault-root-token
-      containers:
-        - name: setup-eso-role
-          image: hashicorp/vault:1.15.4
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eu
-              export PATH="$PATH:/vault-bin"
-              export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
-
-              while [ ! -f /vault-token/VAULT_TOKEN ]; do
-                echo "🔁 Waiting for Vault token file..."
-                sleep 2
-              done
-              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
-
-              echo "🛡️ Writing Vault policy 'mcp-external-secrets'..."
-              vault policy write "mcp-external-secrets" - <<'EOF'
-              # ESO needs read on all paths referenced by ExternalSecrets in mcp ns
-              path "secret/data/vaultadmin"                 { capabilities = ["read"] }
-              path "secret/data/yugabyte/config"            { capabilities = ["read"] }
-              path "yugabyte-db/static-creds/mcp-app"       { capabilities = ["read"] }
-              path "secret/data/open_ai_key"                { capabilities = ["read"] }
-              EOF
-
-              echo "🔗 Binding Vault k8s role 'mcp-external-secrets' to SA mcp/mcp-server..."
-              vault write auth/kubernetes/role/mcp-external-secrets \
-                bound_service_account_names="mcp-server" \
-                bound_service_account_namespaces="mcp" \
-                policies="mcp-external-secrets" \
-                ttl="24h"
-
-              echo "✅ ESO role/policy ready."
-          volumeMounts:
-            - name: root-token
-              mountPath: /vault-token
-              readOnly: true
-          resources:
-            requests: { cpu: "50m",  memory: "64Mi" }
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =========================================
