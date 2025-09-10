@@ -161,6 +161,19 @@ data:
   MCP_LOG_LEVEL: "info"
 ---
 # ========= Vault bootstrap helpers (run in vault ns) =========
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vault-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: vault
+    namespace: vault
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -229,15 +242,14 @@ spec:
             # Enable k8s auth if missing
             vault auth list -format=json | jq -e 'has("kubernetes/")' >/dev/null 2>&1 || vault auth enable kubernetes
 
-            # K8s TokenReview config (issuer validation disabled)
+            # Configure without persisting a reviewer token (Vault will use its own SA token)
             KUBE_HOST="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-            TOKEN_REVIEWER_JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
             CA_FILE="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
             vault write auth/kubernetes/config \
-              token_reviewer_jwt="$TOKEN_REVIEWER_JWT" \
               kubernetes_host="$KUBE_HOST" \
               kubernetes_ca_cert=@"$CA_FILE" \
+              token_reviewer_jwt="" \
               disable_iss_validation=true
 
             # ESO policy + role
@@ -254,7 +266,7 @@ spec:
               policies="mcp-external-secrets" \
               ttl="24h"
 
-            echo "Configured ESO role mcp-external-secrets (iss validation disabled)."
+            echo "Configured ESO role mcp-external-secrets (no stored reviewer token)."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
