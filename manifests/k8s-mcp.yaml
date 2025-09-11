@@ -139,10 +139,11 @@ spec:
         DB_PORT: "5433"
         DB_NAME: "mcp"
         DATABASE_URL: "postgres://mcp_app:{{ .password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/mcp?sslmode=disable"
-  # pull the whole data map from Vault's database engine response
-  dataFrom:
-    - extract:
+  data:
+    - secretKey: password
+      remoteRef:
         key: yugabyte-db/static-creds/mcp-app
+        property: password
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
