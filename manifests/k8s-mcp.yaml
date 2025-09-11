@@ -3,7 +3,10 @@ kind: Namespace
 metadata:
   name: mcp
   annotations:
-    linkerd.io/inject: "disabled"
+    linkerd.io/inject: disabled
+    field.cattle.io/projectId: local:applications
+    scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
+    config.linkerd.io/opaque-ports: "5433,8200,443"
 ---
 # Service accounts for RO and Admin
 apiVersion: v1
