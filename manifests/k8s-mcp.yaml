@@ -186,6 +186,48 @@ spec:
         key: open_ai_key
         property: value
 ---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ghcr-pull
+  namespace: mcp
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: vault-kv
+  target:
+    name: ghcr-pull
+    creationPolicy: Owner
+    template:
+      type: kubernetes.io/dockerconfigjson
+      engineVersion: v2
+      data:
+        .dockerconfigjson: |
+          {{
+            printf "{\"auths\":{\"ghcr.io\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"unused@example.com\",\"auth\":\"%s\"}}}"
+            .username
+            .token
+            (printf "%s:%s" .username .token | b64enc)
+          }}
+  data:
+    - secretKey: username
+      remoteRef:
+        key: mcp-mcp-image-pull-username               # e.g. secret/ghcr
+        property: value      # value stored under this key
+    - secretKey: token
+      remoteRef:
+        key: mcp-mcp-image-pull-token
+        property: value
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server
+  namespace: mcp
+imagePullSecrets:
+  - name: ghcr-pull
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
