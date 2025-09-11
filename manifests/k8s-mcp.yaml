@@ -610,7 +610,7 @@ spec:
                   optional: true
             # Make shared kubectl available on PATH if you ever exec into the pod
             - name: PATH
-              value: "/shared-utils:${PATH}"
+              value: "/shared-utils:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           ports:
             - name: http
               containerPort: 8080
