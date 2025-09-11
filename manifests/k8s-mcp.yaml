@@ -205,7 +205,7 @@ spec:
       data:
         .dockerconfigjson: |
           {{
-            printf "{\"auths\":{\"ghcr.io\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"unused@example.com\",\"auth\":\"%s\"}}}"
+            printf "{\"auths\":{\"ghcr.io\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"administrator@suncoast.systems\",\"auth\":\"%s\"}}}"
             .username
             .token
             (printf "%s:%s" .username .token | b64enc)
