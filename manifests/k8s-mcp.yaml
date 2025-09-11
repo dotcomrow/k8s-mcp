@@ -96,16 +96,6 @@ spec:
       remoteRef:
         key: vaultadmin
         property: password
-    - secretKey: host
-      remoteRef:
-        key: yugabyte/config
-        property: host
-        optional: true
-    - secretKey: port
-      remoteRef:
-        key: yugabyte/config
-        property: port
-        optional: true
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
@@ -127,8 +117,8 @@ spec:
           postgres://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/mcp?sslmode=disable
         DB_USERNAME: "{{ .username }}"
         DB_PASSWORD: "{{ .password }}"
-        DB_HOST: "{{ .host }}"
-        DB_PORT: "{{ .port }}"
+        DB_HOST: "yb-tserver-service.yugabyte.svc.cluster.local"
+        DB_PORT: "5433"
         DB_NAME: "mcp"
   data:
     - secretKey: username
@@ -139,14 +129,6 @@ spec:
       remoteRef:
         key: yugabyte-db/static-creds/mcp-app
         property: password
-    - secretKey: host
-      remoteRef:
-        key: yugabyte/config
-        property: host
-    - secretKey: port
-      remoteRef:
-        key: yugabyte/config
-        property: port
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
