@@ -59,7 +59,7 @@ subjects:
 apiVersion: external-secrets.io/v1
 kind: SecretStore
 metadata:
-  name: vault
+  name: vault-kv
   namespace: mcp
 spec:
   provider:
@@ -69,10 +69,27 @@ spec:
       version: v2
       auth:
         kubernetes:
+          mountPath: kubernetes
+          role: mcp-external-secrets
           serviceAccountRef:
             name: mcp-server
-          role: mcp-external-secrets
+---
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-raw
+  namespace: mcp
+spec:
+  provider:
+    vault:
+      server: http://vault.vault.svc.cluster.local:8200
+      # no path/version: ExternalSecret keys are treated as absolute Vault API paths
+      auth:
+        kubernetes:
           mountPath: kubernetes
+          role: mcp-external-secrets
+          serviceAccountRef:
+            name: mcp-server
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
@@ -83,19 +100,22 @@ spec:
   refreshInterval: 1h
   secretStoreRef:
     kind: SecretStore
-    name: vault
+    name: vault-kv
   target:
     name: yb-vaultadmin
     creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        username: "vaultadmin"
+        password: "{{ .vaultadmin_password }}"
+        host: "yb-tserver-service.yugabyte.svc.cluster.local"
+        port: "5433"
   data:
-    - secretKey: username
+    - secretKey: vaultadmin_password
       remoteRef:
         key: vaultadmin
-        property: username
-    - secretKey: password
-      remoteRef:
-        key: vaultadmin
-        property: password
+        property: value
 ---
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
@@ -106,25 +126,20 @@ spec:
   refreshInterval: 5m
   secretStoreRef:
     kind: SecretStore
-    name: vault
+    name: vault-raw
   target:
     name: mcp-db-static
     creationPolicy: Owner
     template:
       engineVersion: v2
       data:
-        DATABASE_URL: >-
-          postgres://{{ .username }}:{{ .password }}@{{ .host }}:{{ .port }}/mcp?sslmode=disable
-        DB_USERNAME: "{{ .username }}"
+        DB_USERNAME: "mcp_app"  # static username
         DB_PASSWORD: "{{ .password }}"
         DB_HOST: "yb-tserver-service.yugabyte.svc.cluster.local"
         DB_PORT: "5433"
         DB_NAME: "mcp"
+        DATABASE_URL: "postgres://mcp_app:{{ .password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/mcp?sslmode=disable"
   data:
-    - secretKey: username
-      remoteRef:
-        key: yugabyte-db/static-creds/mcp-app
-        property: username
     - secretKey: password
       remoteRef:
         key: yugabyte-db/static-creds/mcp-app
@@ -139,16 +154,19 @@ spec:
   refreshInterval: 1h
   secretStoreRef:
     kind: SecretStore
-    name: vault
+    name: vault-kv
   target:
     name: mcp-apis
     creationPolicy: Owner
+    template:
+      engineVersion: v2
+      data:
+        OPENAI_API_KEY: "{{ .openai_value }}"
   data:
-    - secretKey: OPENAI_API_KEY
+    - secretKey: openai_value
       remoteRef:
         key: open_ai_key
-        property: OPENAI_API_KEY
-        optional: true
+        property: value
 ---
 apiVersion: v1
 kind: ConfigMap
