@@ -316,10 +316,12 @@ spec:
               export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
 
               vault policy write "mcp-external-secrets" - <<'EOF'
-              path "secret/data/vaultadmin"                 { capabilities = ["read"] }
-              path "secret/data/yugabyte/config"            { capabilities = ["read"] }
-              path "yugabyte-db/static-creds/mcp-app"       { capabilities = ["read"] }
-              path "secret/data/open_ai_key"                { capabilities = ["read"] }
+              path "secret/data/vaultadmin"                   { capabilities = ["read"] }
+              path "secret/data/mcp-mcp-image-pull-token"     { capabilities = ["read"] }
+              path "secret/data/mcp-mcp-image-pull-username"  { capabilities = ["read"] }
+              path "secret/data/yugabyte/config"              { capabilities = ["read"] }
+              path "yugabyte-db/static-creds/mcp-app"         { capabilities = ["read"] }
+              path "secret/data/open_ai_key"                  { capabilities = ["read"] }
               EOF
 
               vault write auth/kubernetes/role/mcp-external-secrets \
