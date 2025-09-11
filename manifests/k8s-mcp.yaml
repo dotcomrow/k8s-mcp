@@ -126,12 +126,13 @@ spec:
           image: ghcr.io/azure/mcp-kubernetes:latest
           imagePullPolicy: IfNotPresent
           args:
-            # HTTP/SSE server config (see Azure README)
             - --transport=streamable-http
-            - --http-host=0.0.0.0
-            - --http-port=8080
-            # Access level: readonly | namespace | cluster
-            - --access=readonly
+            - --host=0.0.0.0
+            - --port=8080
+            - --access-level=readonly
+            # Optional extras:
+            # - --additional-tools=helm,cilium,hubble
+            # - --allow-namespaces=default,mcp
           ports:
             - name: http
               containerPort: 8080
@@ -182,9 +183,13 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --transport=streamable-http
-            - --http-host=0.0.0.0
-            - --http-port=8080
-            - --access=cluster
+            - --host=0.0.0.0
+            - --port=8080
+            - --access-level=admin
+            # Safer alternative if you prefer limited mutation:
+            # - --access-level=readwrite
+            # - --allow-namespaces=default,mcp
+            # - --additional-tools=helm
           ports:
             - name: http
               containerPort: 8080
@@ -236,7 +241,7 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openwebui
-          podSelector: {}   # or refine with app=openwebui
+          podSelector: {}   # refine if you label OpenWebUI pods (e.g., app=openwebui)
       ports:
         - protocol: TCP
           port: 8080
