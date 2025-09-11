@@ -8,7 +8,9 @@ metadata:
     scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
     config.linkerd.io/opaque-ports: "5433,8200,443"
 ---
-# Service accounts
+# ======================
+# Service Accounts
+# ======================
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -20,9 +22,11 @@ kind: ServiceAccount
 metadata:
   name: mcp-server-admin
   namespace: mcp
-
-# ---------- RBAC ----------
 ---
+# ======================
+# RBAC
+# ======================
+# Read-only cluster role
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -44,6 +48,7 @@ rules:
     resources: ["ingresses","networkpolicies"]
     verbs: ["get","list","watch"]
 ---
+# Admin (broad) role
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -71,6 +76,7 @@ rules:
     resources: ["poddisruptionbudgets"]
     verbs: ["*"]
 ---
+# Bindings
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -96,30 +102,42 @@ subjects:
   - kind: ServiceAccount
     name: mcp-server-admin
     namespace: mcp
-
-# ---------- RO server ----------
 ---
+# ======================
+# MCP SERVER (READ-ONLY) — HTTP/SSE
+# ======================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcp-server-ro
   namespace: mcp
-  labels: { app: mcp-server-ro }
+  labels:
+    app: mcp-server-ro
 spec:
   replicas: 1
-  selector: { matchLabels: { app: mcp-server-ro } }
+  selector:
+    matchLabels:
+      app: mcp-server-ro
   template:
     metadata:
-      labels: { app: mcp-server-ro }
+      labels:
+        app: mcp-server-ro
     spec:
       serviceAccountName: mcp-server-ro
       automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 10
       volumes:
         - name: kube
           emptyDir: {}
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
+          securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -185,38 +203,52 @@ kind: Service
 metadata:
   name: mcp-server-ro
   namespace: mcp
-  labels: { app: mcp-server-ro }
+  labels:
+    app: mcp-server-ro
 spec:
   type: ClusterIP
-  selector: { app: mcp-server-ro }
+  selector:
+    app: mcp-server-ro
   ports:
     - name: http
       port: 8080
       targetPort: http
-
-# ---------- Admin server ----------
 ---
+# ======================
+# MCP SERVER (ADMIN) — HTTP/SSE
+# ======================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcp-server-admin
   namespace: mcp
-  labels: { app: mcp-server-admin }
+  labels:
+    app: mcp-server-admin
 spec:
   replicas: 1
-  selector: { matchLabels: { app: mcp-server-admin } }
+  selector:
+    matchLabels:
+      app: mcp-server-admin
   template:
     metadata:
-      labels: { app: mcp-server-admin }
+      labels:
+        app: mcp-server-admin
     spec:
       serviceAccountName: mcp-server-admin
       automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      terminationGracePeriodSeconds: 10
       volumes:
         - name: kube
           emptyDir: {}
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
+          securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -259,6 +291,10 @@ spec:
             - --host=0.0.0.0
             - --port=8080
             - --access-level=admin
+            # Optional extras (uncomment if you want these tools exposed)
+            # - --additional-tools=helm
+            # Limit to specific namespaces if desired (comma-separated)
+            # - --allow-namespaces=default,openwebui,mcp
           ports:
             - name: http
               containerPort: 8080
@@ -282,17 +318,20 @@ kind: Service
 metadata:
   name: mcp-server-admin
   namespace: mcp
-  labels: { app: mcp-server-admin }
+  labels:
+    app: mcp-server-admin
 spec:
   type: ClusterIP
-  selector: { app: mcp-server-admin }
+  selector:
+    app: mcp-server-admin
   ports:
     - name: http
       port: 8080
       targetPort: http
-
-# ---------- NetworkPolicy (allow only OpenWebUI to call these) ----------
 ---
+# ======================
+# NetworkPolicy — allow only OpenWebUI namespace to reach these
+# ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
