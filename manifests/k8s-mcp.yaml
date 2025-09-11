@@ -3,740 +3,237 @@ kind: Namespace
 metadata:
   name: mcp
   annotations:
-    linkerd.io/inject: disabled
-    field.cattle.io/projectId: local:applications
-    scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
-    config.linkerd.io/opaque-ports: "5433,8200,443"
+    linkerd.io/inject: "disabled"
+---
+# Service accounts for RO and Admin
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server-ro
+  namespace: mcp
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: mcp-server
+  name: mcp-server-admin
   namespace: mcp
+
+# --------------------
+# RBAC
+# --------------------
 ---
-# RBAC so MCP can manage the local cluster (trim later for least-privilege)
+# Read-only role (safe default)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: mcp-server-controller
+  name: mcp-server-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["pods","pods/log","services","endpoints","configmaps","events","namespaces","nodes"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments","statefulsets","daemonsets","replicasets"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs","cronjobs"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get","list","watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses","networkpolicies"]
+    verbs: ["get","list","watch"]
+---
+# Admin role (mutating)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-server-admin
 rules:
   - apiGroups: [""]
     resources: ["pods","pods/log","services","endpoints","configmaps","secrets","events","namespaces","nodes","persistentvolumeclaims"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
   - apiGroups: ["apps"]
     resources: ["deployments","statefulsets","daemonsets","replicasets"]
-    verbs: ["get","list","watch","create","update","patch","delete","scale"]
+    verbs: ["*"]
   - apiGroups: ["batch"]
     resources: ["jobs","cronjobs"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles","rolebindings","clusterroles","clusterrolebindings"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses","networkpolicies"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
-    verbs: ["get","list","watch","create","update","patch","delete"]
+    verbs: ["*"]
+---
+# Bindings
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-server-readonly
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-server-readonly
+subjects:
+  - kind: ServiceAccount
+    name: mcp-server-ro
+    namespace: mcp
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: mcp-server-controller
+  name: mcp-server-admin-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: mcp-server-controller
+  name: mcp-server-admin
 subjects:
   - kind: ServiceAccount
-    name: mcp-server
+    name: mcp-server-admin
     namespace: mcp
+
+# --------------------
+# Deployments & Services
+# --------------------
 ---
-# ========= External Secrets: SecretStore + ExternalSecrets =========
-apiVersion: external-secrets.io/v1
-kind: SecretStore
-metadata:
-  name: vault-kv
-  namespace: mcp
-spec:
-  provider:
-    vault:
-      server: http://vault.vault.svc.cluster.local:8200
-      path: secret
-      version: v2
-      auth:
-        kubernetes:
-          mountPath: kubernetes
-          role: mcp-external-secrets
-          serviceAccountRef:
-            name: mcp-server
----
-apiVersion: external-secrets.io/v1
-kind: SecretStore
-metadata:
-  name: vault-raw
-  namespace: mcp
-spec:
-  provider:
-    vault:
-      server: http://vault.vault.svc.cluster.local:8200
-      # no path/version: ExternalSecret keys are treated as absolute Vault API paths
-      auth:
-        kubernetes:
-          mountPath: kubernetes
-          role: mcp-external-secrets
-          serviceAccountRef:
-            name: mcp-server
----
-apiVersion: external-secrets.io/v1
-kind: SecretStore
-metadata:
-  name: vault-db
-  namespace: mcp
-spec:
-  provider:
-    vault:
-      server: http://vault.vault.svc.cluster.local:8200
-      path: yugabyte-db        # <-- DB engine mount
-      version: v1              # <-- IMPORTANT: no /data prefixing
-      auth:
-        kubernetes:
-          mountPath: kubernetes
-          role: mcp-external-secrets
-          serviceAccountRef:
-            name: mcp-server
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: yb-vaultadmin
-  namespace: mcp
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    kind: SecretStore
-    name: vault-kv
-  target:
-    name: yb-vaultadmin
-    creationPolicy: Owner
-    template:
-      engineVersion: v2
-      data:
-        username: "vaultadmin"
-        password: "{{ .vaultadmin_password }}"
-        host: "yb-tserver-service.yugabyte.svc.cluster.local"
-        port: "5433"
-  data:
-    - secretKey: vaultadmin_password
-      remoteRef:
-        key: vaultadmin
-        property: value
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: mcp-db-static
-  namespace: mcp
-spec:
-  refreshInterval: 5m
-  secretStoreRef:
-    kind: SecretStore
-    name: vault-db            # <-- use the DB store
-  target:
-    name: mcp-db-static
-    creationPolicy: Owner
-    template:
-      engineVersion: v2
-      data:
-        DB_USERNAME: "mcp_app"
-        DB_PASSWORD: "{{ .password }}"
-        DB_HOST: "yb-tserver-service.yugabyte.svc.cluster.local"
-        DB_PORT: "5433"
-        DB_NAME: "mcp"
-        DATABASE_URL: "postgres://mcp_app:{{ .password }}@yb-tserver-service.yugabyte.svc.cluster.local:5433/mcp?sslmode=disable"
-  data:
-    - secretKey: password
-      remoteRef:
-        key: static-creds/mcp-app   # <-- relative to mount, no /data
-        property: password
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: mcp-apis
-  namespace: mcp
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    kind: SecretStore
-    name: vault-kv
-  target:
-    name: mcp-apis
-    creationPolicy: Owner
-    template:
-      engineVersion: v2
-      data:
-        OPENAI_API_KEY: "{{ .openai_value }}"
-  data:
-    - secretKey: openai_value
-      remoteRef:
-        key: open_ai_key
-        property: value
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  name: ghcr-pull
-  namespace: mcp
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    kind: SecretStore
-    name: vault-kv
-  target:
-    name: ghcr-pull
-    creationPolicy: Owner
-    template:
-      type: kubernetes.io/dockerconfigjson
-      engineVersion: v2
-      data:
-        .dockerconfigjson: |
-          {{
-            printf "{\"auths\":{\"ghcr.io\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"administrator@suncoast.systems\",\"auth\":\"%s\"}}}"
-            .username
-            .token
-            (printf "%s:%s" .username .token | b64enc)
-          }}
-  data:
-    - secretKey: username
-      remoteRef:
-        key: mcp-mcp-image-pull-username               # e.g. secret/ghcr
-        property: value      # value stored under this key
-    - secretKey: token
-      remoteRef:
-        key: mcp-mcp-image-pull-token
-        property: value
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: mcp-server
-  namespace: mcp
-imagePullSecrets:
-  - name: ghcr-pull
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mcp-config
-  namespace: mcp
-data:
-  MCP_SERVER_NAME: "mcp-k8s"
-  MCP_LOG_LEVEL: "info"
----
-# ===============================
-# Copy Vault root token to mcp ns
-# ===============================
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: copy-mcp-vault-root-token
-  namespace: vault
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      annotations:
-        linkerd.io/inject: "disabled"
-    spec:
-      restartPolicy: Never
-      serviceAccountName: default
-      containers:
-        - name: copy-secret
-          image: alpine/k8s:1.31.4
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eu
-              NS_SRC="vault"
-              NS_DST="mcp"
-              SRC_NAME="vault-root-token"
-              DST_NAME="vault-root-token"
-
-              echo "🔁 Copying ${SRC_NAME} from ${NS_SRC} to ${NS_DST}/${DST_NAME}..."
-              if ! kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" >/dev/null 2>&1; then
-                echo "❌ Source secret ${NS_SRC}/${SRC_NAME} not found"; exit 1
-              fi
-              kubectl -n "${NS_SRC}" get secret "${SRC_NAME}" -o json \
-                | jq '.metadata.namespace="'"${NS_DST}"'"|.metadata.name="'"${DST_NAME}"'"|del(.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.ownerReferences)' \
-                | kubectl apply -f -
-              echo "✅ Copied."
-          resources:
-            requests: { cpu: "50m", memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
----
-# =========================================
-# Create Vault policy+role for ESO (reads only what MCP needs)
-# =========================================
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mcp-eso-vault-role
-  namespace: vault
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      annotations:
-        linkerd.io/inject: "disabled"
-    spec:
-      restartPolicy: Never
-      serviceAccountName: default
-      volumes:
-        - name: root-token
-          secret:
-            secretName: vault-root-token
-      containers:
-        - name: setup-eso-role
-          image: hashicorp/vault:1.15.4
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eu
-              export PATH="$PATH:/vault-bin"
-              export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
-
-              while [ ! -f /vault-token/VAULT_TOKEN ]; do
-                echo "Waiting for Vault token..."
-                sleep 2
-              done
-              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
-
-              vault policy write "mcp-external-secrets" - <<'EOF'
-              path "secret/data/vaultadmin"                   { capabilities = ["read"] }
-              path "secret/data/mcp-mcp-image-pull-token"     { capabilities = ["read"] }
-              path "secret/data/mcp-mcp-image-pull-username"  { capabilities = ["read"] }
-              path "secret/data/yugabyte/config"              { capabilities = ["read"] }
-              path "yugabyte-db/static-creds/mcp-app"         { capabilities = ["read"] }
-              path "secret/data/open_ai_key"                  { capabilities = ["read"] }
-              EOF
-
-              vault write auth/kubernetes/role/mcp-external-secrets \
-                bound_service_account_names="mcp-server" \
-                bound_service_account_namespaces="mcp" \
-                policies="mcp-external-secrets" \
-                ttl="24h"
-
-              echo "Configured ESO role mcp-external-secrets."
-          volumeMounts:
-            - name: root-token
-              mountPath: /vault-token
-              readOnly: true
-          resources:
-            requests: { cpu: "50m",  memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
----
-# =========================================
-# Yugabyte + Vault database engine bootstrap
-# STATIC username (mcp_app) with rotating password
-# =========================================
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: mcp-yugabyte-config
-  namespace: vault
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      annotations:
-        linkerd.io/inject: "disabled"
-    spec:
-      restartPolicy: Never
-      serviceAccountName: default
-      volumes:
-        - name: root-token
-          secret:
-            secretName: vault-root-token
-      containers:
-        - name: setup-role
-          image: hashicorp/vault:1.15.4
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -eu
-
-              PGHOST="${PGHOST:-yb-tserver-service.yugabyte.svc.cluster.local}"
-              PGPORT="${PGPORT:-5433}"
-              DB="mcp"
-              BASE_ROLE="mcp"
-              OWNER_ROLE="mcp_app"
-              VAULTADMIN_USER="vaultadmin"
-
-              apk add --no-cache postgresql15-client jq netcat-openbsd curl
-              export PATH="$PATH:/vault-bin"
-              export VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
-
-              while [ ! -f /vault-token/VAULT_TOKEN ]; do
-                echo "Waiting for Vault token..."
-                sleep 2
-              done
-              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
-
-              # Ensure KVv2 at 'secret/'
-              if ! vault secrets list -format=json | jq -e '."secret/".type=="kv" and ."secret/".options.version=="2"' >/dev/null 2>&1; then
-                if vault secrets list -format=json | jq -e 'has("secret/")' >/dev/null 2>&1; then
-                  echo "'secret/' exists but is not KVv2; please migrate manually."; exit 1
-                else
-                  vault secrets enable -path=secret -version=2 kv
-                fi
-              fi
-
-              # Fetch vaultadmin creds
-              VAULTADMIN_PASS="$(vault kv get -format=json secret/${VAULTADMIN_USER} 2>/dev/null | jq -r '.data.data.password // .data.data.value // empty' || true)"
-              if [ -z "${VAULTADMIN_PASS:-}" ] || [ "${VAULTADMIN_PASS}" = "null" ]; then
-                echo "secret/${VAULTADMIN_USER} missing 'password'"; exit 1
-              fi
-              export PGPASSWORD="$VAULTADMIN_PASS"
-
-              until getent hosts "$PGHOST" >/dev/null 2>&1; do sleep 3; done
-              until nc -z -w1 "$PGHOST" "$PGPORT"; do sleep 3; done
-
-              DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d yugabyte -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'" || true)"
-              if [ "${DB_EXISTS}" != "1" ]; then
-                createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$DB"
-              fi
-
-              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$DB" <<EOSQL
-              DO \$\$
-              BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${BASE_ROLE}') THEN
-                  CREATE ROLE ${BASE_ROLE} NOLOGIN INHERIT;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${OWNER_ROLE}') THEN
-                  CREATE ROLE ${OWNER_ROLE} LOGIN INHERIT;
-                END IF;
-              END
-              \$\$;
-
-              CREATE SCHEMA IF NOT EXISTS mcp AUTHORIZATION ${VAULTADMIN_USER};
-              ALTER ROLE ${OWNER_ROLE} SET search_path = mcp;
-
-              GRANT USAGE, CREATE ON SCHEMA mcp TO ${BASE_ROLE};
-              GRANT ${BASE_ROLE} TO ${OWNER_ROLE};
-              GRANT CONNECT ON DATABASE ${DB} TO ${OWNER_ROLE};
-
-              GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA mcp TO ${BASE_ROLE};
-              GRANT USAGE, SELECT                     ON ALL SEQUENCES IN SCHEMA mcp TO ${BASE_ROLE};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES   TO ${BASE_ROLE};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT USAGE, SELECT                ON SEQUENCES TO ${BASE_ROLE};
-
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp TO ${VAULTADMIN_USER};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp TO ${VAULTADMIN_USER};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON TABLES    TO ${VAULTADMIN_USER};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp GRANT ALL ON SEQUENCES TO ${VAULTADMIN_USER};
-
-              if ! vault secrets list -format=json | jq -e 'has("yugabyte-db/")' >/dev/null 2>&1; then
-                vault secrets enable -path=yugabyte-db database
-              fi
-
-              vault write yugabyte-db/static-roles/mcp-app \
-                db_name="yugabyte" \
-                username="${OWNER_ROLE}" \
-                rotation_statements="ALTER ROLE ${OWNER_ROLE} WITH PASSWORD '{{password}}';" \
-                rotation_period="720h"
-
-              vault policy write "mcp" - <<'EOF'
-              path "yugabyte-db/static-creds/mcp-app" { capabilities = ["read"] }
-              path "secret/data/vaultadmin"           { capabilities = ["read"] }
-              path "secret/data/mcp/*"                { capabilities = ["read"] }
-              EOF
-
-              vault write auth/kubernetes/role/mcp \
-                bound_service_account_names="mcp-server" \
-                bound_service_account_namespaces="mcp" \
-                policies="mcp" \
-                ttl="48h"
-
-              CREDS_JSON="$(vault read -format=json yugabyte-db/static-creds/mcp-app)"
-              APP_USER="$(printf '%s' "$CREDS_JSON" | jq -r .data.username)"
-              APP_PASS="$(printf '%s' "$CREDS_JSON" | jq -r .data.password)"
-              export PGPASSWORD="$APP_PASS"
-              psql -h "$PGHOST" -p "$PGPORT" -U "$APP_USER" -d "$DB" -c "SELECT current_user, current_schema();" || exit 1
-              echo "MCP DB + Vault static role ready."
-          volumeMounts:
-            - name: root-token
-              mountPath: /vault-token
-              readOnly: true
-          resources:
-            requests: { cpu: "50m",  memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
----
-# ========= Optional: ensure DB exists from app side =========
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: db-bootstrap-mcp-presence
-  namespace: mcp
-spec:
-  backoffLimit: 0
-  template:
-    metadata:
-      annotations:
-        linkerd.io/inject: "disabled"
-    spec:
-      restartPolicy: Never
-      serviceAccountName: mcp-server
-      containers:
-        - name: bootstrap
-          image: postgres:14
-          resources:
-            requests: { cpu: "50m", memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
-          env:
-            - name: YB_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: host
-                  optional: true
-            - name: YB_PORT
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: port
-                  optional: true
-            - name: YB_USER
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: username
-            - name: YB_PASS
-              valueFrom:
-                secretKeyRef:
-                  name: yb-vaultadmin
-                  key: password
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              H=${YB_HOST:-"yb-tserver-service.yugabyte.svc.cluster.local"}
-              P=${YB_PORT:-"5433"}
-              export PGPASSWORD="${YB_PASS}"
-              echo "Checking DB 'mcp' presence..."
-              psql -h "$H" -p "$P" -U "$YB_USER" -d yugabyte -tc "SELECT 1 FROM pg_database WHERE datname='mcp'" | grep -q 1 || \
-                psql -h "$H" -p "$P" -U "$YB_USER" -d postgres -c "CREATE DATABASE mcp"
-              echo "OK."
----
-# ========= MCP server (alpine/k8s shared-utils pattern) =========
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-server
+  name: mcp-server-ro
   namespace: mcp
-  labels:
-    app: mcp-server
+  labels: { app: mcp-server-ro }
 spec:
   replicas: 1
   selector:
-    matchLabels:
-      app: mcp-server
+    matchLabels: { app: mcp-server-ro }
   template:
     metadata:
-      labels:
-        app: mcp-server
+      labels: { app: mcp-server-ro }
     spec:
-      serviceAccountName: mcp-server
-      nodeSelector:
-        dedicated: srvr-node
-      volumes:
-        - name: config
-          configMap:
-            name: mcp-config
-        - name: shared-utils
-          emptyDir: {}
-      initContainers:
-        # 1) Install kubectl into shared volume from alpine/k8s
-        - name: install-utils
-          image: alpine:3.20
-          command: ["sh","-c"]
-          args:
-            - |
-              set -euo pipefail
-              apk add --no-cache curl jq
-
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/version"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-              GIT_VERSION="$(curl -sS --fail --cacert "$CA" -H "Authorization: Bearer $TOKEN" "$API" | jq -r .gitVersion)"
-              # Keep only vMAJOR.MINOR.PATCH (drop +rke2r1, -eks-*, etc.)
-              BASE_VERSION="$(echo "$GIT_VERSION" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/v\1/')"
-
-              case "$(uname -m)" in
-                x86_64)  ARCH=amd64 ;;
-                aarch64) ARCH=arm64 ;;
-                armv7l)  ARCH=arm ;;
-                ppc64le) ARCH=ppc64le ;;
-                s390x)   ARCH=s390x ;;
-                riscv64) ARCH=riscv64 ;;
-                *)       ARCH=amd64 ;;
-              esac
-
-              echo "→ Server: $GIT_VERSION  | using: $BASE_VERSION  | arch: $ARCH"
-
-              URL="https://dl.k8s.io/release/${BASE_VERSION}/bin/linux/${ARCH}/kubectl"
-              if ! curl -fsSLo /shared/kubectl "$URL"; then
-                # Fallback to the latest patch for this minor (still within skew)
-                MINOR="$(echo "$BASE_VERSION" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/')"
-                STABLE_MINOR="$(curl -fsSL "https://dl.k8s.io/release/stable-${MINOR}.txt")"
-                echo "Primary fetch failed, falling back to $STABLE_MINOR"
-                curl -fsSLo /shared/kubectl "https://dl.k8s.io/release/${STABLE_MINOR}/bin/linux/${ARCH}/kubectl"
-              fi
-              chmod +x /shared/kubectl
-              /shared/kubectl version --client --output=yaml || { echo "kubectl invalid"; exit 1; }
-          volumeMounts:
-            - name: shared-utils
-              mountPath: /shared
-        # 2) Use the shared kubectl to wait for secrets to exist
-        - name: wait-for-secrets
-          image: alpine:3.20
-          command: ["sh","-c"]
-          args:
-            - |
-              set -eu
-              echo "Waiting for required secrets..."
-              for S in mcp-db-static; do
-                until /shared/kubectl -n mcp get secret "$S" >/dev/null 2>&1; do
-                  echo "  - $S not ready yet"
-                  sleep 2
-                done
-              done
-              echo "Secrets ready."
-          volumeMounts:
-            - name: shared-utils
-              mountPath: /shared
+      serviceAccountName: mcp-server-ro
       containers:
         - name: mcp
-          image: ghcr.io/alexei-led/k8s-mcp-server:1.3
+          image: ghcr.io/azure/mcp-kubernetes:latest
           imagePullPolicy: IfNotPresent
-          env:
-            - name: MCP_SERVER_NAME
-              valueFrom:
-                configMapKeyRef:
-                  name: mcp-config
-                  key: MCP_SERVER_NAME
-            - name: MCP_LOG_LEVEL
-              valueFrom:
-                configMapKeyRef:
-                  name: mcp-config
-                  key: MCP_LOG_LEVEL
-            # Database (STATIC user with rotating password)
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DATABASE_URL
-            - name: DB_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DB_USERNAME
-            - name: DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DB_PASSWORD
-            - name: DB_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DB_HOST
-            - name: DB_PORT
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DB_PORT
-            - name: DB_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-db-static
-                  key: DB_NAME
-            # Optional LLM/API keys
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: mcp-apis
-                  key: OPENAI_API_KEY
-                  optional: true
-            # Make shared kubectl available on PATH if you ever exec into the pod
-            - name: PATH
-              value: "/shared-utils:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          args:
+            # HTTP/SSE server config (see Azure README)
+            - --transport=streamable-http
+            - --http-host=0.0.0.0
+            - --http-port=8080
+            # Access level: readonly | namespace | cluster
+            - --access=readonly
           ports:
             - name: http
               containerPort: 8080
           readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 5
+            tcpSocket: { port: http }
+            initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 15
+            tcpSocket: { port: http }
+            initialDelaySeconds: 10
             periodSeconds: 20
           resources:
-            requests:
-              cpu: "250m"
-              memory: "256Mi"
-            limits:
-              cpu: "1"
-              memory: "1Gi"
-          volumeMounts:
-            - name: config
-              mountPath: /etc/mcp/config
-              readOnly: true
-            - name: shared-utils
-              mountPath: /shared-utils
-              readOnly: true
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: mcp-server
+  name: mcp-server-ro
   namespace: mcp
-  labels:
-    app: mcp-server
+  labels: { app: mcp-server-ro }
 spec:
   type: ClusterIP
-  selector:
-    app: mcp-server
+  selector: { app: mcp-server-ro }
   ports:
     - name: http
-      port: 80
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server-admin
+  namespace: mcp
+  labels: { app: mcp-server-admin }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-server-admin }
+  template:
+    metadata:
+      labels: { app: mcp-server-admin }
+    spec:
+      serviceAccountName: mcp-server-admin
+      containers:
+        - name: mcp
+          image: ghcr.io/azure/mcp-kubernetes:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --transport=streamable-http
+            - --http-host=0.0.0.0
+            - --http-port=8080
+            - --access=cluster
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server-admin
+  namespace: mcp
+  labels: { app: mcp-server-admin }
+spec:
+  type: ClusterIP
+  selector: { app: mcp-server-admin }
+  ports:
+    - name: http
+      port: 8080
       targetPort: http
 
-# =========================
-# Optional: APISIX Exposure
-# =========================
-# ---
-# apiVersion: apisix.apache.org/v2
-# kind: ApisixRoute
-# metadata:
-#   name: mcp-server
-#   namespace: mcp
-# spec:
-#   http:
-#     - name: mcp
-#       match:
-#         hosts:
-#           - mcp.app.suncoast.systems
-#         paths:
-#           - /*
-#       backends:
-#         - serviceName: mcp-server
-#           servicePort: 80
-#       plugins: []
+# --------------------
+# NetworkPolicy: only allow OpenWebUI to call the MCP servers
+# Adjust namespace/labels to match your OpenWebUI install.
+# --------------------
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-allow-openwebui
+  namespace: mcp
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["mcp-server-ro","mcp-server-admin"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+          podSelector: {}   # or refine with app=openwebui
+      ports:
+        - protocol: TCP
+          port: 8080
