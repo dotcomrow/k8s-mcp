@@ -505,29 +505,35 @@ spec:
               set -euo pipefail
               apk add --no-cache curl jq
 
-              # Discover server version directly from API
               API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/version"
               TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
               CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
               GIT_VERSION="$(curl -sS --fail --cacert "$CA" -H "Authorization: Bearer $TOKEN" "$API" | jq -r .gitVersion)"
+              # Keep only vMAJOR.MINOR.PATCH (drop +rke2r1, -eks-*, etc.)
+              BASE_VERSION="$(echo "$GIT_VERSION" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/v\1/')"
 
-              # Arch mapping
               case "$(uname -m)" in
                 x86_64)  ARCH=amd64 ;;
                 aarch64) ARCH=arm64 ;;
                 armv7l)  ARCH=arm ;;
+                ppc64le) ARCH=ppc64le ;;
+                s390x)   ARCH=s390x ;;
+                riscv64) ARCH=riscv64 ;;
                 *)       ARCH=amd64 ;;
               esac
 
-              echo "→ Server reports version: $GIT_VERSION (arch=$ARCH)"
+              echo "→ Server: $GIT_VERSION  | using: $BASE_VERSION  | arch: $ARCH"
 
-              # Download matching kubectl
-              URL="https://dl.k8s.io/release/${GIT_VERSION}/bin/linux/${ARCH}/kubectl"
-              curl -fsSL "$URL" -o /shared/kubectl
+              URL="https://dl.k8s.io/release/${BASE_VERSION}/bin/linux/${ARCH}/kubectl"
+              if ! curl -fsSLo /shared/kubectl "$URL"; then
+                # Fallback to the latest patch for this minor (still within skew)
+                MINOR="$(echo "$BASE_VERSION" | sed -E 's/^v([0-9]+\.[0-9]+)\..*/\1/')"
+                STABLE_MINOR="$(curl -fsSL "https://dl.k8s.io/release/stable-${MINOR}.txt")"
+                echo "Primary fetch failed, falling back to $STABLE_MINOR"
+                curl -fsSLo /shared/kubectl "https://dl.k8s.io/release/${STABLE_MINOR}/bin/linux/${ARCH}/kubectl"
+              fi
               chmod +x /shared/kubectl
-
-              # sanity
-              /shared/kubectl version --client --output=json || { echo "kubectl invalid"; exit 1; }
+              /shared/kubectl version --client --output=yaml || { echo "kubectl invalid"; exit 1; }
           volumeMounts:
             - name: shared-utils
               mountPath: /shared
