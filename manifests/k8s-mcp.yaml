@@ -343,8 +343,8 @@ metadata:
   namespace: mcp
 data:
   app.py: |
-    import os, time, asyncio, re
-    from typing import Any, Dict, Optional, Callable
+    import os, time, asyncio, re, json, random
+    from typing import Any, Dict, Optional, List, Tuple
     from fastapi import FastAPI, Body, Response
     from fastapi.routing import APIRoute
     from fastapi import APIRouter
@@ -353,10 +353,18 @@ data:
     MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp")
     STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
 
-    app = FastAPI(title="MCP OpenAPI Bridge", version="0.2.0")
+    app = FastAPI(title="MCP OpenAPI Bridge", version="0.3.0",
+                  description="Bridges an MCP server to detailed OpenAPI operations with granular, example-rich endpoints.")
+
     _session_id: Optional[str] = None
     _client: Optional[httpx.AsyncClient] = None
     _tools_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # -------------------------
+    # Utility helpers
+    # -------------------------
+    def _safe(name: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 
     async def get_client():
         global _client
@@ -388,49 +396,182 @@ data:
             return
         await rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
 
-    def _safe_path(name: str) -> str:
-        # turn "kubectl.pods.list" -> "kubectl_pods_list"
-        return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-    async def _load_tools() -> Dict[str, Dict[str, Any]]:
-        """Fetch and cache tools from MCP."""
+    async def load_tools() -> Dict[str, Dict[str, Any]]:
         global _tools_cache
         if _tools_cache is not None:
             return _tools_cache
         await ensure_initialized()
         result = await rpc("tools/list")
-        tools = {}
+        tools: Dict[str, Dict[str, Any]] = {}
         for t in result.get("tools", []):
-            # expected: { "name": str, "description": str, "inputSchema": {...} }
             if "name" in t:
                 tools[t["name"]] = t
         _tools_cache = tools
         return tools
 
-    def _add_tool_route(router: APIRouter, tool: Dict[str, Any]):
-        tool_name = tool["name"]
-        path_name = _safe_path(tool_name)
-        summary = tool.get("description") or f"Call MCP tool {tool_name}"
+    # -------------------------
+    # JSON Schema → example
+    # -------------------------
+    def example_from_schema(schema: Dict[str, Any]) -> Any:
+        """Create a best-effort example instance from JSON Schema."""
+        if not isinstance(schema, dict):
+            return None
+        if "example" in schema:
+            return schema["example"]
+        t = schema.get("type")
+        if isinstance(t, list):
+            t = t[0]
+
+        # enum first
+        if "enum" in schema and schema["enum"]:
+            return schema["enum"][0]
+
+        if t == "object" or ("properties" in schema):
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            obj = {}
+            for k, v in props.items():
+                # prefer defaults
+                if "default" in v:
+                    obj[k] = v["default"]
+                else:
+                    ex = example_from_schema(v)
+                    if ex is None:
+                        # lightweight sensible defaults
+                        vt = v.get("type")
+                        if vt == "string":
+                            if "enum" in v and v["enum"]:
+                                ex = v["enum"][0]
+                            else:
+                                ex = "value"
+                        elif vt == "integer" or vt == "number":
+                            ex = 1
+                        elif vt == "boolean":
+                            ex = True
+                        elif vt == "array":
+                            ex = []
+                        elif vt == "object":
+                            ex = {}
+                        else:
+                            ex = "value"
+                    obj[k] = ex
+            # include only required by default to keep prompts simple
+            if required:
+                obj = {k: v for k, v in obj.items() if k in required}
+            return obj
+
+        if t == "array":
+            items = schema.get("items", {})
+            return [example_from_schema(items)]
+
+        if t == "string":
+            return schema.get("default") or "value"
+        if t == "integer" or t == "number":
+            return schema.get("default") or 1
+        if t == "boolean":
+            return schema.get("default") or True
+
+        # fallback
+        return schema.get("default") or None
+
+    def strip_fixed_fields(schema: Dict[str, Any], fixed: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of schema with any fixed fields removed from request body (since they are provided by path)."""
+        if not schema or schema.get("type") != "object":
+            return schema
+        schema = json.loads(json.dumps(schema))
+        props = schema.setdefault("properties", {})
+        req = set(schema.get("required", []))
+        for k in list(fixed.keys()):
+            if k in props:
+                props.pop(k, None)
+            if k in req:
+                req.remove(k)
+        schema["required"] = list(req)
+        return schema
+
+    # -------------------------
+    # Route builders
+    # -------------------------
+    def add_generic_routes(router: APIRouter, tools: Dict[str, Dict[str, Any]]):
+        @router.get("/healthz", summary="Health check")
+        async def healthz():
+            return {"ok": True, "tools": list(tools.keys())}
+
+        @router.post("/tools/list", summary="Raw MCP tool listing")
+        async def tools_list():
+            return {"tools": list(tools.values())}
+
+        @router.post("/tools/call", summary="Raw MCP tool call")
+        async def tools_call(name: str = Body(..., embed=True),
+                             arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
+            return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
+
+    def add_schema_helpers(router: APIRouter, tool: Dict[str, Any]):
+        tname = tool["name"]
+        pname = _safe(tname)
+
+        async def schema_handler():
+            return tool.get("inputSchema") or {"type": "object"}
+
+        async def example_handler():
+            ex = example_from_schema(tool.get("inputSchema") or {"type": "object"})
+            return {"name": tname, "arguments": ex or {}}
+
+        router.add_api_route(
+            path=f"/tool/{pname}/schema",
+            endpoint=schema_handler,
+            methods=["GET"],
+            name=f"{tname} schema",
+            summary=f"Get JSON Schema for {tname}",
+            operation_id=f"{tname}_schema",
+            tags=[tname],
+        )
+        router.add_api_route(
+            path=f"/tool/{pname}/example",
+            endpoint=example_handler,
+            methods=["GET"],
+            name=f"{tname} example",
+            summary=f"Get example arguments for {tname}",
+            operation_id=f"{tname}_example",
+            tags=[tname],
+        )
+
+    def add_tool_route(router: APIRouter, tool: Dict[str, Any]):
+        """Single ‘tool-wide’ endpoint retaining full flexibility."""
+        tname = tool["name"]
+        pname = _safe(tname)
         schema = tool.get("inputSchema") or {"type": "object"}
+        desc = (tool.get("description") or f"Call MCP tool {tname}. "
+               f"Prefer this when granular endpoints below don’t match your need.")
 
         async def handler(body: Dict[str, Any] = Body(default={}, embed=False)) -> Any:
-            await ensure_initialized()
-            return await rpc("tools/call", {"name": tool_name, "arguments": body or {}})
+            return await rpc("tools/call", {"name": tname, "arguments": body or {}})
 
-        # Create route with custom operation_id and requestBody schema in OpenAPI
         route = APIRoute(
-            path=f"/tool/{path_name}",
+            path=f"/tool/{pname}",
             endpoint=handler,
             methods=["POST"],
-            name=tool_name,                # visible name
-            summary=summary,
-            operation_id=tool_name,        # IMPORTANT: becomes function name for tool-calling models
+            name=tname,
+            summary=desc,
+            operation_id=tname,  # visible to planners as the function name
+            tags=[tname],
             openapi_extra={
+                "x-instructions": (
+                    "This is the generic form of the tool. "
+                    "Use a more specific /tool/{tool}/{action}[/{kind}] endpoint if available. "
+                    "Send JSON matching the schema; omit fields that are fixed by the granular endpoints."
+                ),
                 "requestBody": {
                     "required": True,
                     "content": {
                         "application/json": {
-                            "schema": schema
+                            "schema": schema,
+                            "examples": {
+                                "typical": {
+                                    "summary": "Typical call",
+                                    "value": example_from_schema(schema) or {}
+                                }
+                            }
                         }
                     }
                 }
@@ -438,35 +579,151 @@ data:
         )
         router.routes.append(route)
 
+    def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+        """Heuristic: find enum choices for action/verb and kind/resource."""
+        if not isinstance(schema, Dict):
+            return ([], [])
+        props = schema.get("properties", {})
+        # action/verb
+        action_key = next((k for k in ["action", "verb", "operation", "op"] if k in props), None)
+        actions = props.get(action_key, {}).get("enum", []) if action_key else []
+        # kind/resource
+        kind_key = next((k for k in ["kind", "resource", "resources"] if k in props), None)
+        kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
+        return (actions, kinds)
+
+    def add_granular_routes(router: APIRouter, tool: Dict[str, Any]):
+        """Create /tool/{name}/{action}[/{kind}] for enum’d schemas to simplify prompting."""
+        schema = tool.get("inputSchema") or {"type": "object"}
+        actions, kinds = iter_action_kind(schema)
+        if not actions and not kinds:
+            return  # nothing to expand
+
+        tname = tool["name"]
+        pname = _safe(tname)
+
+        # Build action-only endpoints
+        for action in actions or []:
+            fixed = {"action": action}
+            reduced_schema = strip_fixed_fields(schema, fixed)
+            op_id = f"{tname}_{_safe(action)}"
+
+            async def handler_action(body: Dict[str, Any] = Body(default={}, embed=False), _fixed=fixed) -> Any:
+                args = body or {}
+                args.update(_fixed)
+                return await rpc("tools/call", {"name": tname, "arguments": args})
+
+            ex = example_from_schema(reduced_schema) or {}
+            path = f"/tool/{pname}/{_safe(action)}"
+            route = APIRoute(
+                path=path,
+                endpoint=handler_action,
+                methods=["POST"],
+                name=f"{tname}:{action}",
+                summary=f"{tname} → {action}",
+                description=(f"Convenience endpoint that fixes `action: \"{action}\"`. "
+                             "Provide only the remaining fields in the body."),
+                operation_id=op_id,
+                tags=[tname, action],
+                openapi_extra={
+                    "x-instructions": (
+                        f"Use this when the desired action is '{action}'. "
+                        "Do not include the fixed field `action` in the request body; it is implied by the path."
+                    ),
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": reduced_schema,
+                                "examples": {
+                                    "typical": {"summary": "Typical", "value": ex}
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            router.routes.append(route)
+
+        # Build action + kind endpoints
+        for action in actions or ["_"]:
+            for kind in kinds or []:
+                if action == "_":  # no action enum, only kind enum
+                    fixed = {"kind": kind}
+                    suffix = _safe(kind)
+                    summary = f"{tname} → {kind}"
+                    desc = f"Fixes `kind: \"{kind}\"`."
+                    tags = [tname, kind]
+                    op_id = f"{tname}_{_safe(kind)}"
+                else:
+                    fixed = {"action": action, "kind": kind}
+                    suffix = f"{_safe(action)}/{_safe(kind)}"
+                    summary = f"{tname} → {action}/{kind}"
+                    desc = f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`."
+                    tags = [tname, action, kind]
+                    op_id = f"{tname}_{_safe(action)}_{_safe(kind)}"
+
+                reduced_schema = strip_fixed_fields(schema, fixed)
+
+                async def handler_action_kind(body: Dict[str, Any] = Body(default={}, embed=False), _fixed=fixed) -> Any:
+                    args = body or {}
+                    args.update(_fixed)
+                    return await rpc("tools/call", {"name": tname, "arguments": args})
+
+                ex = example_from_schema(reduced_schema) or {}
+                route = APIRoute(
+                    path=f"/tool/{pname}/{suffix}",
+                    endpoint=handler_action_kind,
+                    methods=["POST"],
+                    name=f"{tname}:{summary}",
+                    summary=summary,
+                    description=f"Convenience endpoint. {desc} Provide only remaining fields.",
+                    operation_id=op_id,
+                    tags=tags,
+                    openapi_extra={
+                        "x-instructions": (
+                            "Prefer this endpoint over the generic one when both action and resource kind are known. "
+                            "Omit any fixed fields from the body; they are implied by the path."
+                        ),
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": reduced_schema,
+                                    "examples": {
+                                        "typical": {"summary": "Typical", "value": ex}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                router.routes.append(route)
+
+    # -------------------------
+    # Startup: initialize MCP & build routes
+    # -------------------------
     @app.on_event("startup")
     async def startup():
-        # wait for MCP and build routes
         deadline = time.time() + STARTUP_TIMEOUT
+        last_err = None
         while time.time() < deadline:
             try:
                 await ensure_initialized()
-                tools = await _load_tools()
+                tools = await load_tools()
                 router = APIRouter()
+                add_generic_routes(router, tools)
+                # tool-specific
                 for t in tools.values():
-                    _add_tool_route(router, t)
-                # Also keep generic endpoints for debugging
-                @router.get("/healthz")
-                async def healthz():
-                    return {"ok": True, "tools": list(tools.keys())}
-
-                @router.post("/tools/list")
-                async def tools_list():
-                    return {"tools": list(tools.values())}
-
-                @router.post("/tools/call")
-                async def tools_call(name: str = Body(..., embed=True),
-                                     arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
-                    return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
-
+                    add_schema_helpers(router, t)
+                    add_tool_route(router, t)
+                    add_granular_routes(router, t)
                 app.include_router(router)
                 return
-            except Exception:
+            except Exception as e:
+                last_err = e
                 await asyncio.sleep(1)
+        raise RuntimeError(f"Startup failed: {last_err}")
 
   requirements.txt: |
     fastapi==0.114.2
