@@ -343,84 +343,131 @@ metadata:
   namespace: mcp
 data:
   app.py: |
-    import os
-    import time
-    import asyncio
-    from typing import Any, Dict, Optional
+    import os, time, asyncio, re
+    from typing import Any, Dict, Optional, Callable
     from fastapi import FastAPI, Body, Response
+    from fastapi.routing import APIRoute
+    from fastapi import APIRouter
     import httpx
 
     MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp")
     STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
 
-    app = FastAPI(title="MCP OpenAPI Bridge", version="0.1.0")
+    app = FastAPI(title="MCP OpenAPI Bridge", version="0.2.0")
     _session_id: Optional[str] = None
     _client: Optional[httpx.AsyncClient] = None
+    _tools_cache: Optional[Dict[str, Dict[str, Any]]] = None
 
     async def get_client():
-      global _client
-      if _client is None:
-        _client = httpx.AsyncClient(timeout=30)
-      return _client
+        global _client
+        if _client is None:
+            _client = httpx.AsyncClient(timeout=30)
+        return _client
 
     async def rpc(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-      global _session_id
-      client = await get_client()
-      headers = {}
-      if _session_id:
-        headers["mcp-session-id"] = _session_id
-      payload = {"jsonrpc":"2.0","id":str(int(time.time()*1000)),"method":method}
-      if params is not None:
-        payload["params"] = params
-      resp = await client.post(MCP_RPC_URL, json=payload, headers=headers)
-      resp.raise_for_status()
-      sid = resp.headers.get("mcp-session-id")
-      if sid:
-        _session_id = sid
-      data = resp.json()
-      if "error" in data:
-        raise RuntimeError(f"MCP error: {data['error']}")
-      return data["result"]
+        global _session_id
+        client = await get_client()
+        headers = {}
+        if _session_id:
+            headers["mcp-session-id"] = _session_id
+        payload = {"jsonrpc": "2.0", "id": str(int(time.time() * 1000)), "method": method}
+        if params is not None:
+            payload["params"] = params
+        resp = await client.post(MCP_RPC_URL, json=payload, headers=headers)
+        resp.raise_for_status()
+        sid = resp.headers.get("mcp-session-id")
+        if sid:
+            _session_id = sid
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(f"MCP error: {data['error']}")
+        return data["result"]
 
     async def ensure_initialized():
-      global _session_id
-      if _session_id:
-        return
-      await rpc("initialize", {"protocolVersion":"2024-11-05","capabilities":{}})
+        if _session_id:
+            return
+        await rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
+
+    def _safe_path(name: str) -> str:
+        # turn "kubectl.pods.list" -> "kubectl_pods_list"
+        return re.sub(r"[^a-zA-Z0-9_]", "_", name)
+
+    async def _load_tools() -> Dict[str, Dict[str, Any]]:
+        """Fetch and cache tools from MCP."""
+        global _tools_cache
+        if _tools_cache is not None:
+            return _tools_cache
+        await ensure_initialized()
+        result = await rpc("tools/list")
+        tools = {}
+        for t in result.get("tools", []):
+            # expected: { "name": str, "description": str, "inputSchema": {...} }
+            if "name" in t:
+                tools[t["name"]] = t
+        _tools_cache = tools
+        return tools
+
+    def _add_tool_route(router: APIRouter, tool: Dict[str, Any]):
+        tool_name = tool["name"]
+        path_name = _safe_path(tool_name)
+        summary = tool.get("description") or f"Call MCP tool {tool_name}"
+        schema = tool.get("inputSchema") or {"type": "object"}
+
+        async def handler(body: Dict[str, Any] = Body(default={}, embed=False)) -> Any:
+            await ensure_initialized()
+            return await rpc("tools/call", {"name": tool_name, "arguments": body or {}})
+
+        # Create route with custom operation_id and requestBody schema in OpenAPI
+        route = APIRoute(
+            path=f"/tool/{path_name}",
+            endpoint=handler,
+            methods=["POST"],
+            name=tool_name,                # visible name
+            summary=summary,
+            operation_id=tool_name,        # IMPORTANT: becomes function name for tool-calling models
+            openapi_extra={
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": schema
+                        }
+                    }
+                }
+            },
+        )
+        router.routes.append(route)
 
     @app.on_event("startup")
     async def startup():
-      deadline = time.time() + STARTUP_TIMEOUT
-      while time.time() < deadline:
-        try:
-          await ensure_initialized()
-          return
-        except Exception:
-          await asyncio.sleep(1)
+        # wait for MCP and build routes
+        deadline = time.time() + STARTUP_TIMEOUT
+        while time.time() < deadline:
+            try:
+                await ensure_initialized()
+                tools = await _load_tools()
+                router = APIRouter()
+                for t in tools.values():
+                    _add_tool_route(router, t)
+                # Also keep generic endpoints for debugging
+                @router.get("/healthz")
+                async def healthz():
+                    return {"ok": True, "tools": list(tools.keys())}
 
-    @app.get("/healthz")
-    async def healthz():
-      try:
-        await ensure_initialized()
-        return {"ok": True}
-      except Exception:
-        return Response(content="not ready", status_code=503)
+                @router.post("/tools/list")
+                async def tools_list():
+                    return {"tools": list(tools.values())}
 
-    @app.post("/tools/list")
-    async def tools_list():
-      await ensure_initialized()
-      return await rpc("tools/list")
+                @router.post("/tools/call")
+                async def tools_call(name: str = Body(..., embed=True),
+                                     arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
+                    return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
 
-    @app.post("/tools/call")
-    async def tools_call(name: str = Body(..., embed=True),
-                         arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
-      await ensure_initialized()
-      return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
+                app.include_router(router)
+                return
+            except Exception:
+                await asyncio.sleep(1)
 
-    @app.post("/resources/list")
-    async def resources_list():
-      await ensure_initialized()
-      return await rpc("resources/list")
   requirements.txt: |
     fastapi==0.114.2
     uvicorn==0.30.6
