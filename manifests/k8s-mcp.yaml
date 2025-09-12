@@ -104,7 +104,7 @@ subjects:
     namespace: mcp
 ---
 # ======================
-# MCP SERVER (READ-ONLY) — HTTP/SSE
+# MCP SERVER (READ-ONLY) — HTTP/streamable-http
 # ======================
 apiVersion: apps/v1
 kind: Deployment
@@ -137,8 +137,10 @@ spec:
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
-          securityContext: { runAsUser: 0, runAsNonRoot: false }
-          command: ["/bin/sh","-c"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          command: ["/bin/sh","-lc"]
           args:
             - |
               set -eu
@@ -215,7 +217,7 @@ spec:
       targetPort: http
 ---
 # ======================
-# MCP SERVER (ADMIN) — HTTP/SSE
+# MCP SERVER (ADMIN) — HTTP/streamable-http
 # ======================
 apiVersion: apps/v1
 kind: Deployment
@@ -248,8 +250,10 @@ spec:
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
-          securityContext: { runAsUser: 0, runAsNonRoot: false }
-          command: ["/bin/sh","-c"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+          command: ["/bin/sh","-lc"]
           args:
             - |
               set -eu
@@ -329,7 +333,7 @@ spec:
       targetPort: http
 
 # =================================================================
-# === NEW: OpenAPI bridge code (FastAPI) + two bridge deployments ===
+# === OpenAPI bridge code (FastAPI) + two bridge deployments
 # =================================================================
 ---
 apiVersion: v1
@@ -447,7 +451,7 @@ spec:
       initContainers:
         - name: prep
           image: python:3.11-slim
-          command: ["/bin/sh","-c"]
+          command: ["/bin/sh","-lc"]
           args:
             - |
               set -eux
@@ -459,14 +463,15 @@ spec:
       containers:
         - name: bridge
           image: python:3.11-slim
+          workingDir: /app
           env:
             - name: MCP_RPC_URL
               value: "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp"
             - name: STARTUP_TIMEOUT
               value: "30"
             - name: PYTHONPATH
-              value: "/app/deps"
-          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+              value: "/app:/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080","--app-dir","/app"]
           ports:
             - name: http
               containerPort: 8080
@@ -523,7 +528,7 @@ spec:
       initContainers:
         - name: prep
           image: python:3.11-slim
-          command: ["/bin/sh","-c"]
+          command: ["/bin/sh","-lc"]
           args:
             - |
               set -eux
@@ -535,14 +540,15 @@ spec:
       containers:
         - name: bridge
           image: python:3.11-slim
+          workingDir: /app
           env:
             - name: MCP_RPC_URL
               value: "http://mcp-server-admin.mcp.svc.cluster.local:8080/mcp"
             - name: STARTUP_TIMEOUT
               value: "30"
             - name: PYTHONPATH
-              value: "/app/deps"
-          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+              value: "/app:/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080","--app-dir","/app"]
           ports:
             - name: http
               containerPort: 8080
@@ -576,7 +582,7 @@ spec:
 
 # ======================
 # NetworkPolicy — allow only OpenWebUI + kubelet/node health probes
-# (updated to also allow OpenAPI bridge pods to reach MCP servers)
+# (also allow the OpenAPI bridge pods to reach MCP servers)
 # ======================
 ---
 apiVersion: networking.k8s.io/v1
@@ -610,10 +616,10 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # 3) Allow kubelet/node health probes (tighten this to your node CIDRs)
+    # 3) Allow kubelet/node health probes (tighten to your node CIDRs)
     - from:
         - ipBlock:
-            cidr: 0.0.0.0/0   # TODO: set to your node subnet(s), e.g. 10.0.0.0/8
+            cidr: 0.0.0.0/0   # TODO: replace with your node subnet(s), e.g. 10.0.0.0/8
       ports:
         - protocol: TCP
           port: 8080
