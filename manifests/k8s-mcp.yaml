@@ -327,10 +327,258 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+
+# =================================================================
+# === NEW: OpenAPI bridge code (FastAPI) + two bridge deployments ===
+# =================================================================
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-openapi-bridge-code
+  namespace: mcp
+data:
+  app.py: |
+    import os
+    import time
+    import asyncio
+    from typing import Any, Dict, Optional
+    from fastapi import FastAPI, Body, Response
+    import httpx
+
+    MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp")
+    STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
+
+    app = FastAPI(title="MCP OpenAPI Bridge", version="0.1.0")
+    _session_id: Optional[str] = None
+    _client: Optional[httpx.AsyncClient] = None
+
+    async def get_client():
+      global _client
+      if _client is None:
+        _client = httpx.AsyncClient(timeout=30)
+      return _client
+
+    async def rpc(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+      global _session_id
+      client = await get_client()
+      headers = {}
+      if _session_id:
+        headers["mcp-session-id"] = _session_id
+      payload = {"jsonrpc":"2.0","id":str(int(time.time()*1000)),"method":method}
+      if params is not None:
+        payload["params"] = params
+      resp = await client.post(MCP_RPC_URL, json=payload, headers=headers)
+      resp.raise_for_status()
+      sid = resp.headers.get("mcp-session-id")
+      if sid:
+        _session_id = sid
+      data = resp.json()
+      if "error" in data:
+        raise RuntimeError(f"MCP error: {data['error']}")
+      return data["result"]
+
+    async def ensure_initialized():
+      global _session_id
+      if _session_id:
+        return
+      await rpc("initialize", {"protocolVersion":"2024-11-05","capabilities":{}})
+
+    @app.on_event("startup")
+    async def startup():
+      deadline = time.time() + STARTUP_TIMEOUT
+      while time.time() < deadline:
+        try:
+          await ensure_initialized()
+          return
+        except Exception:
+          await asyncio.sleep(1)
+
+    @app.get("/healthz")
+    async def healthz():
+      try:
+        await ensure_initialized()
+        return {"ok": True}
+      except Exception:
+        return Response(content="not ready", status_code=503)
+
+    @app.post("/tools/list")
+    async def tools_list():
+      await ensure_initialized()
+      return await rpc("tools/list")
+
+    @app.post("/tools/call")
+    async def tools_call(name: str = Body(..., embed=True),
+                         arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
+      await ensure_initialized()
+      return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
+
+    @app.post("/resources/list")
+    async def resources_list():
+      await ensure_initialized()
+      return await rpc("resources/list")
+  requirements.txt: |
+    fastapi==0.114.2
+    uvicorn==0.30.6
+    httpx==0.27.2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-openapi-ro
+  namespace: mcp
+  labels: { app: mcp-openapi-ro }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-openapi-ro }
+  template:
+    metadata:
+      labels: { app: mcp-openapi-ro }
+    spec:
+      serviceAccountName: mcp-server-ro
+      volumes:
+        - name: app
+          emptyDir: {}
+        - name: code
+          configMap:
+            name: mcp-openapi-bridge-code
+            defaultMode: 0444
+      initContainers:
+        - name: prep
+          image: python:3.11-slim
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
+              cp /code/app.py /app/app.py
+          volumeMounts:
+            - { name: code, mountPath: /code, readOnly: true }
+            - { name: app,  mountPath: /app }
+      containers:
+        - name: bridge
+          image: python:3.11-slim
+          env:
+            - name: MCP_RPC_URL
+              value: "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp"
+            - name: STARTUP_TIMEOUT
+              value: "30"
+            - name: PYTHONPATH
+              value: "/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            initialDelaySeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
+            initialDelaySeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-openapi-ro
+  namespace: mcp
+  labels: { app: mcp-openapi-ro }
+spec:
+  type: ClusterIP
+  selector: { app: mcp-openapi-ro }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-openapi-admin
+  namespace: mcp
+  labels: { app: mcp-openapi-admin }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-openapi-admin }
+  template:
+    metadata:
+      labels: { app: mcp-openapi-admin }
+    spec:
+      serviceAccountName: mcp-server-admin
+      volumes:
+        - name: app
+          emptyDir: {}
+        - name: code
+          configMap:
+            name: mcp-openapi-bridge-code
+            defaultMode: 0444
+      initContainers:
+        - name: prep
+          image: python:3.11-slim
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eux
+              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
+              cp /code/app.py /app/app.py
+          volumeMounts:
+            - { name: code, mountPath: /code, readOnly: true }
+            - { name: app,  mountPath: /app }
+      containers:
+        - name: bridge
+          image: python:3.11-slim
+          env:
+            - name: MCP_RPC_URL
+              value: "http://mcp-server-admin.mcp.svc.cluster.local:8080/mcp"
+            - name: STARTUP_TIMEOUT
+              value: "30"
+            - name: PYTHONPATH
+              value: "/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            initialDelaySeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
+            initialDelaySeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-openapi-admin
+  namespace: mcp
+  labels: { app: mcp-openapi-admin }
+spec:
+  type: ClusterIP
+  selector: { app: mcp-openapi-admin }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+
 # ======================
 # NetworkPolicy — allow only OpenWebUI + kubelet/node health probes
+# (updated to also allow OpenAPI bridge pods to reach MCP servers)
 # ======================
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -344,7 +592,7 @@ spec:
         values: ["mcp-server-ro","mcp-server-admin"]
   policyTypes: ["Ingress"]
   ingress:
-    # 1) Allow calls from OpenWebUI namespace (adjust selector if your OpenWebUI is labeled differently)
+    # 1) Allow calls from OpenWebUI namespace
     - from:
         - namespaceSelector:
             matchLabels:
@@ -352,10 +600,46 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # 2) Allow kubelet/node health probes (REPLACE with your real node CIDR!)
+    # 2) Allow same-namespace OpenAPI bridge pods to call MCP servers
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["mcp-openapi-ro","mcp-openapi-admin"]
+      ports:
+        - protocol: TCP
+          port: 8080
+    # 3) Allow kubelet/node health probes (tighten this to your node CIDRs)
     - from:
         - ipBlock:
             cidr: 0.0.0.0/0   # TODO: set to your node subnet(s), e.g. 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 8080
+
+# ======================
+# NetworkPolicy — only OpenWebUI may reach the OpenAPI bridges
+# ======================
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-openapi-allow-openwebui
+  namespace: mcp
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["mcp-openapi-ro","mcp-openapi-admin"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+          podSelector: {}
       ports:
         - protocol: TCP
           port: 8080
