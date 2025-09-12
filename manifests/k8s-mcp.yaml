@@ -1,340 +1,315 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: mcp
-  annotations:
-    linkerd.io/inject: disabled
-    field.cattle.io/projectId: local:applications
-    scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
-    config.linkerd.io/opaque-ports: "5433,8200,443"
----
 # ======================
-# Service Accounts
+# Config: OpenAPI bridges (code + requirements)
 # ======================
 apiVersion: v1
-kind: ServiceAccount
+kind: ConfigMap
 metadata:
-  name: mcp-server-ro
+  name: mcp-openapi-bridge-code
   namespace: mcp
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: mcp-server-admin
-  namespace: mcp
+data:
+  app.py: |
+    import os
+    import time
+    import asyncio
+    from typing import Any, Dict, Optional
+    from fastapi import FastAPI, Body, Response
+    import httpx
+
+    MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp")
+    STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
+
+    app = FastAPI(title="MCP OpenAPI Bridge", version="0.1.0")
+    _session_id: Optional[str] = None
+    _client: Optional[httpx.AsyncClient] = None
+
+    async def get_client():
+      global _client
+      if _client is None:
+        _client = httpx.AsyncClient(timeout=30)
+      return _client
+
+    async def rpc(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+      """Send a JSON-RPC request to the MCP server and manage the session header."""
+      global _session_id
+      client = await get_client()
+      headers = {}
+      if _session_id:
+        headers["mcp-session-id"] = _session_id
+
+      payload = {
+        "jsonrpc": "2.0",
+        "id": str(int(time.time() * 1000)),
+        "method": method,
+      }
+      if params is not None:
+        payload["params"] = params
+
+      resp = await client.post(MCP_RPC_URL, json=payload, headers=headers)
+      resp.raise_for_status()
+      # Capture session id header if present
+      sid = resp.headers.get("mcp-session-id")
+      if sid:
+        _session_id = sid
+
+      data = resp.json()
+      if "error" in data:
+        raise RuntimeError(f"MCP error: {data['error']}")
+      return data["result"]
+
+    async def ensure_initialized():
+      """Call initialize once to establish session."""
+      global _session_id
+      if _session_id:
+        return
+      try:
+        await rpc("initialize", {
+          "protocolVersion":"2024-11-05",
+          "capabilities": {}
+        })
+      except Exception as e:
+        # Bubble up; probes will retry
+        raise
+
+    @app.on_event("startup")
+    async def startup():
+      # Try initialize a few times so readiness can succeed soon after start
+      deadline = time.time() + STARTUP_TIMEOUT
+      last_err = None
+      while time.time() < deadline:
+        try:
+          await ensure_initialized()
+          return
+        except Exception as e:
+          last_err = e
+          await asyncio.sleep(1)
+      if last_err:
+        # allow pod to start; readiness probe will gate traffic
+        pass
+
+    @app.get("/healthz")
+    async def healthz():
+      try:
+        await ensure_initialized()
+        return {"ok": True}
+      except Exception as e:
+        return Response(content="not ready", status_code=503)
+
+    @app.post("/tools/list")
+    async def tools_list():
+      await ensure_initialized()
+      return await rpc("tools/list")
+
+    @app.post("/tools/call")
+    async def tools_call(
+      name: str = Body(..., embed=True),
+      arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)
+    ):
+      await ensure_initialized()
+      return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
+
+    @app.post("/resources/list")
+    async def resources_list():
+      await ensure_initialized()
+      return await rpc("resources/list")
+
+  requirements.txt: |
+    fastapi==0.114.2
+    uvicorn==0.30.6
+    httpx==0.27.2
 ---
 # ======================
-# RBAC
-# ======================
-# Read-only cluster role
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: mcp-server-readonly
-rules:
-  - apiGroups: [""]
-    resources: ["pods","pods/log","services","endpoints","configmaps","events","namespaces","nodes"]
-    verbs: ["get","list","watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments","statefulsets","daemonsets","replicasets"]
-    verbs: ["get","list","watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs","cronjobs"]
-    verbs: ["get","list","watch"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get","list","watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses","networkpolicies"]
-    verbs: ["get","list","watch"]
----
-# Admin (broad) role
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: mcp-server-admin
-rules:
-  - apiGroups: [""]
-    resources: ["pods","pods/log","services","endpoints","configmaps","secrets","events","namespaces","nodes","persistentvolumeclaims"]
-    verbs: ["*"]
-  - apiGroups: ["apps"]
-    resources: ["deployments","statefulsets","daemonsets","replicasets"]
-    verbs: ["*"]
-  - apiGroups: ["batch"]
-    resources: ["jobs","cronjobs"]
-    verbs: ["*"]
-  - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles","rolebindings","clusterroles","clusterrolebindings"]
-    verbs: ["*"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses","networkpolicies"]
-    verbs: ["*"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["*"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["*"]
----
-# Bindings
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: mcp-server-readonly
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: mcp-server-readonly
-subjects:
-  - kind: ServiceAccount
-    name: mcp-server-ro
-    namespace: mcp
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: mcp-server-admin-binding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: mcp-server-admin
-subjects:
-  - kind: ServiceAccount
-    name: mcp-server-admin
-    namespace: mcp
----
-# ======================
-# MCP SERVER (READ-ONLY) — HTTP/SSE
+# RO OpenAPI Bridge
 # ======================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-server-ro
+  name: mcp-openapi-ro
   namespace: mcp
-  labels:
-    app: mcp-server-ro
+  labels: { app: mcp-openapi-ro }
 spec:
   replicas: 1
   selector:
-    matchLabels:
-      app: mcp-server-ro
+    matchLabels: { app: mcp-openapi-ro }
   template:
     metadata:
-      labels:
-        app: mcp-server-ro
+      labels: { app: mcp-openapi-ro }
     spec:
       serviceAccountName: mcp-server-ro
-      automountServiceAccountToken: true
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-      terminationGracePeriodSeconds: 10
       volumes:
-        - name: kube
+        - name: app
           emptyDir: {}
+        - name: code
+          configMap:
+            name: mcp-openapi-bridge-code
+            defaultMode: 0444
       initContainers:
-        - name: write-kubeconfig
-          image: alpine:3.20
-          securityContext: { runAsUser: 0, runAsNonRoot: false }
+        - name: prep
+          image: python:3.11-slim
           command: ["/bin/sh","-c"]
           args:
             - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+              set -eux
+              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
+              cp /code/app.py /app/app.py
           volumeMounts:
-            - name: kube
-              mountPath: /kube
+            - { name: code, mountPath: /code, readOnly: true }
+            - { name: app,  mountPath: /app }
       containers:
-        - name: mcp
-          image: ghcr.io/azure/mcp-kubernetes:latest
-          imagePullPolicy: IfNotPresent
+        - name: bridge
+          image: python:3.11-slim
           env:
-            - name: KUBECONFIG
-              value: /kube/config
-          args:
-            - --transport=streamable-http
-            - --host=0.0.0.0
-            - --port=8080
-            - --access-level=readonly
+            - name: MCP_RPC_URL
+              value: "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp"
+            - name: STARTUP_TIMEOUT
+              value: "30"
+            - name: PYTHONPATH
+              value: "/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
           ports:
             - name: http
               containerPort: 8080
           readinessProbe:
-            tcpSocket: { port: http }
-            initialDelaySeconds: 3
-            periodSeconds: 10
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            initialDelaySeconds: 2
           livenessProbe:
-            tcpSocket: { port: http }
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
             initialDelaySeconds: 10
-            periodSeconds: 20
           resources:
-            requests: { cpu: "100m", memory: "128Mi" }
+            requests: { cpu: "50m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
           volumeMounts:
-            - name: kube
-              mountPath: /kube
+            - { name: app, mountPath: /app }
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: mcp-server-ro
+  name: mcp-openapi-ro
   namespace: mcp
-  labels:
-    app: mcp-server-ro
+  labels: { app: mcp-openapi-ro }
 spec:
   type: ClusterIP
-  selector:
-    app: mcp-server-ro
+  selector: { app: mcp-openapi-ro }
   ports:
     - name: http
       port: 8080
       targetPort: http
 ---
 # ======================
-# MCP SERVER (ADMIN) — HTTP/SSE
+# Admin OpenAPI Bridge
 # ======================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mcp-server-admin
+  name: mcp-openapi-admin
   namespace: mcp
-  labels:
-    app: mcp-server-admin
+  labels: { app: mcp-openapi-admin }
 spec:
   replicas: 1
   selector:
-    matchLabels:
-      app: mcp-server-admin
+    matchLabels: { app: mcp-openapi-admin }
   template:
     metadata:
-      labels:
-        app: mcp-server-admin
+      labels: { app: mcp-openapi-admin }
     spec:
       serviceAccountName: mcp-server-admin
-      automountServiceAccountToken: true
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        fsGroup: 10001
-      terminationGracePeriodSeconds: 10
       volumes:
-        - name: kube
+        - name: app
           emptyDir: {}
+        - name: code
+          configMap:
+            name: mcp-openapi-bridge-code
+            defaultMode: 0444
       initContainers:
-        - name: write-kubeconfig
-          image: alpine:3.20
-          securityContext: { runAsUser: 0, runAsNonRoot: false }
+        - name: prep
+          image: python:3.11-slim
           command: ["/bin/sh","-c"]
           args:
             - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+              set -eux
+              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
+              cp /code/app.py /app/app.py
           volumeMounts:
-            - name: kube
-              mountPath: /kube
+            - { name: code, mountPath: /code, readOnly: true }
+            - { name: app,  mountPath: /app }
       containers:
-        - name: mcp
-          image: ghcr.io/azure/mcp-kubernetes:latest
-          imagePullPolicy: IfNotPresent
+        - name: bridge
+          image: python:3.11-slim
           env:
-            - name: KUBECONFIG
-              value: /kube/config
-          args:
-            - --transport=streamable-http
-            - --host=0.0.0.0
-            - --port=8080
-            - --access-level=admin
-            # Optional extras:
-            # - --additional-tools=helm
-            # - --allow-namespaces=default,openwebui,mcp
+            - name: MCP_RPC_URL
+              value: "http://mcp-server-admin.mcp.svc.cluster.local:8080/mcp"
+            - name: STARTUP_TIMEOUT
+              value: "30"
+            - name: PYTHONPATH
+              value: "/app/deps"
+          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080"]
           ports:
             - name: http
               containerPort: 8080
           readinessProbe:
-            tcpSocket: { port: http }
-            initialDelaySeconds: 3
-            periodSeconds: 10
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            initialDelaySeconds: 2
           livenessProbe:
-            tcpSocket: { port: http }
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
             initialDelaySeconds: 10
-            periodSeconds: 20
           resources:
-            requests: { cpu: "100m", memory: "128Mi" }
+            requests: { cpu: "50m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
           volumeMounts:
-            - name: kube
-              mountPath: /kube
+            - { name: app, mountPath: /app }
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: mcp-server-admin
+  name: mcp-openapi-admin
   namespace: mcp
-  labels:
-    app: mcp-server-admin
+  labels: { app: mcp-openapi-admin }
 spec:
   type: ClusterIP
-  selector:
-    app: mcp-server-admin
+  selector: { app: mcp-openapi-admin }
   ports:
     - name: http
       port: 8080
       targetPort: http
+
+# ======================
+# NetworkPolicies
+# 1) Allow only OpenWebUI to call the bridges
+# 2) Allow bridges to call MCP servers
+# (we ALSO keep your existing mcp-server NetPolicy but extend its "from")
+# ======================
 ---
-# ======================
-# NetworkPolicy — allow only OpenWebUI + kubelet/node health probes
-# ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mcp-allow-openwebui-and-probes
+  name: mcp-openapi-allow-openwebui
+  namespace: mcp
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["mcp-openapi-ro","mcp-openapi-admin"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+          podSelector: {}   # (optionally refine to app=open-webui)
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Extend the existing policy that targeted only mcp-server pods
+# If you applied a previous "mcp-allow-openwebui" policy, replace it with this superset.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-servers-allow-openwebui-and-bridge
   namespace: mcp
 spec:
   podSelector:
@@ -344,18 +319,22 @@ spec:
         values: ["mcp-server-ro","mcp-server-admin"]
   policyTypes: ["Ingress"]
   ingress:
-    # 1) Allow calls from OpenWebUI namespace (adjust selector if your OpenWebUI is labeled differently)
+    # From OpenWebUI namespace
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openwebui
+          podSelector: {}
       ports:
         - protocol: TCP
           port: 8080
-    # 2) Allow kubelet/node health probes (REPLACE with your real node CIDR!)
+    # From same-namespace OpenAPI bridges
     - from:
-        - ipBlock:
-            cidr: 0.0.0.0/0   # TODO: set to your node subnet(s), e.g. 10.0.0.0/8
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["mcp-openapi-ro","mcp-openapi-admin"]
       ports:
         - protocol: TCP
           port: 8080
