@@ -602,7 +602,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: openwebui
+              kubernetes.io/metadata.name: ollama
       ports:
         - protocol: TCP
           port: 8080
@@ -644,7 +644,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: openwebui
+              kubernetes.io/metadata.name: ollama
           podSelector: {}
       ports:
         - protocol: TCP
