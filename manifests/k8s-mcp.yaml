@@ -141,32 +141,31 @@ spec:
             runAsUser: 0
             runAsNonRoot: false
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
@@ -254,32 +253,31 @@ spec:
             runAsUser: 0
             runAsNonRoot: false
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
@@ -331,405 +329,10 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-
-# =================================================================
-# === OpenAPI bridge code (FastAPI) + two bridge deployments
-# =================================================================
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: mcp-openapi-bridge-code
-  namespace: mcp
-data:
-  app.py: |
-    import os, time, asyncio, re, json, random
-    from typing import Any, Dict, Optional, List, Tuple
-    from fastapi import FastAPI, Body, Response
-    from fastapi.routing import APIRoute
-    from fastapi import APIRouter
-    import httpx
-
-    MCP_RPC_URL = os.environ.get("MCP_RPC_URL", "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp")
-    STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "30"))
-
-    app = FastAPI(title="MCP OpenAPI Bridge", version="0.3.0",
-                  description="Bridges an MCP server to detailed OpenAPI operations with granular, example-rich endpoints.")
-
-    _session_id: Optional[str] = None
-    _client: Optional[httpx.AsyncClient] = None
-    _tools_cache: Optional[Dict[str, Dict[str, Any]]] = None
-
-    # -------------------------
-    # Utility helpers
-    # -------------------------
-    def _safe(name: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_]", "_", name)
-
-    async def get_client():
-        global _client
-        if _client is None:
-            _client = httpx.AsyncClient(timeout=30)
-        return _client
-
-    async def rpc(method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        global _session_id
-        client = await get_client()
-        headers = {}
-        if _session_id:
-            headers["mcp-session-id"] = _session_id
-        payload = {"jsonrpc": "2.0", "id": str(int(time.time() * 1000)), "method": method}
-        if params is not None:
-            payload["params"] = params
-        resp = await client.post(MCP_RPC_URL, json=payload, headers=headers)
-        resp.raise_for_status()
-        sid = resp.headers.get("mcp-session-id")
-        if sid:
-            _session_id = sid
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"MCP error: {data['error']}")
-        return data["result"]
-
-    async def ensure_initialized():
-        if _session_id:
-            return
-        await rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}})
-
-    async def load_tools() -> Dict[str, Dict[str, Any]]:
-        global _tools_cache
-        if _tools_cache is not None:
-            return _tools_cache
-        await ensure_initialized()
-        result = await rpc("tools/list")
-        tools: Dict[str, Dict[str, Any]] = {}
-        for t in result.get("tools", []):
-            if "name" in t:
-                tools[t["name"]] = t
-        _tools_cache = tools
-        return tools
-
-    # -------------------------
-    # JSON Schema → example
-    # -------------------------
-    def example_from_schema(schema: Dict[str, Any]) -> Any:
-        """Create a best-effort example instance from JSON Schema."""
-        if not isinstance(schema, dict):
-            return None
-        if "example" in schema:
-            return schema["example"]
-        t = schema.get("type")
-        if isinstance(t, list):
-            t = t[0]
-
-        # enum first
-        if "enum" in schema and schema["enum"]:
-            return schema["enum"][0]
-
-        if t == "object" or ("properties" in schema):
-            props = schema.get("properties", {})
-            required = set(schema.get("required", []))
-            obj = {}
-            for k, v in props.items():
-                # prefer defaults
-                if "default" in v:
-                    obj[k] = v["default"]
-                else:
-                    ex = example_from_schema(v)
-                    if ex is None:
-                        # lightweight sensible defaults
-                        vt = v.get("type")
-                        if vt == "string":
-                            if "enum" in v and v["enum"]:
-                                ex = v["enum"][0]
-                            else:
-                                ex = "value"
-                        elif vt == "integer" or vt == "number":
-                            ex = 1
-                        elif vt == "boolean":
-                            ex = True
-                        elif vt == "array":
-                            ex = []
-                        elif vt == "object":
-                            ex = {}
-                        else:
-                            ex = "value"
-                    obj[k] = ex
-            # include only required by default to keep prompts simple
-            if required:
-                obj = {k: v for k, v in obj.items() if k in required}
-            return obj
-
-        if t == "array":
-            items = schema.get("items", {})
-            return [example_from_schema(items)]
-
-        if t == "string":
-            return schema.get("default") or "value"
-        if t == "integer" or t == "number":
-            return schema.get("default") or 1
-        if t == "boolean":
-            return schema.get("default") or True
-
-        # fallback
-        return schema.get("default") or None
-
-    def strip_fixed_fields(schema: Dict[str, Any], fixed: Dict[str, Any]) -> Dict[str, Any]:
-        """Return a copy of schema with any fixed fields removed from request body (since they are provided by path)."""
-        if not schema or schema.get("type") != "object":
-            return schema
-        schema = json.loads(json.dumps(schema))
-        props = schema.setdefault("properties", {})
-        req = set(schema.get("required", []))
-        for k in list(fixed.keys()):
-            if k in props:
-                props.pop(k, None)
-            if k in req:
-                req.remove(k)
-        schema["required"] = list(req)
-        return schema
-
-    # -------------------------
-    # Route builders
-    # -------------------------
-    def add_generic_routes(router: APIRouter, tools: Dict[str, Dict[str, Any]]):
-        @router.get("/healthz", summary="Health check")
-        async def healthz():
-            return {"ok": True, "tools": list(tools.keys())}
-
-        @router.post("/tools/list", summary="Raw MCP tool listing")
-        async def tools_list():
-            return {"tools": list(tools.values())}
-
-        @router.post("/tools/call", summary="Raw MCP tool call")
-        async def tools_call(name: str = Body(..., embed=True),
-                             arguments: Optional[Dict[str, Any]] = Body(default=None, embed=True)):
-            return await rpc("tools/call", {"name": name, "arguments": arguments or {}})
-
-    def add_schema_helpers(router: APIRouter, tool: Dict[str, Any]):
-        tname = tool["name"]
-        pname = _safe(tname)
-
-        async def schema_handler():
-            return tool.get("inputSchema") or {"type": "object"}
-
-        async def example_handler():
-            ex = example_from_schema(tool.get("inputSchema") or {"type": "object"})
-            return {"name": tname, "arguments": ex or {}}
-
-        router.add_api_route(
-            path=f"/tool/{pname}/schema",
-            endpoint=schema_handler,
-            methods=["GET"],
-            name=f"{tname} schema",
-            summary=f"Get JSON Schema for {tname}",
-            operation_id=f"{tname}_schema",
-            tags=[tname],
-        )
-        router.add_api_route(
-            path=f"/tool/{pname}/example",
-            endpoint=example_handler,
-            methods=["GET"],
-            name=f"{tname} example",
-            summary=f"Get example arguments for {tname}",
-            operation_id=f"{tname}_example",
-            tags=[tname],
-        )
-
-    def add_tool_route(router: APIRouter, tool: Dict[str, Any]):
-        """Single ‘tool-wide’ endpoint retaining full flexibility."""
-        tname = tool["name"]
-        pname = _safe(tname)
-        schema = tool.get("inputSchema") or {"type": "object"}
-        desc = (tool.get("description") or f"Call MCP tool {tname}. "
-               f"Prefer this when granular endpoints below don’t match your need.")
-
-        async def handler(body: Dict[str, Any] = Body(default={}, embed=False)) -> Any:
-            return await rpc("tools/call", {"name": tname, "arguments": body or {}})
-
-        route = APIRoute(
-            path=f"/tool/{pname}",
-            endpoint=handler,
-            methods=["POST"],
-            name=tname,
-            summary=desc,
-            operation_id=tname,  # visible to planners as the function name
-            tags=[tname],
-            openapi_extra={
-                "x-instructions": (
-                    "This is the generic form of the tool. "
-                    "Use a more specific /tool/{tool}/{action}[/{kind}] endpoint if available. "
-                    "Send JSON matching the schema; omit fields that are fixed by the granular endpoints."
-                ),
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/json": {
-                            "schema": schema,
-                            "examples": {
-                                "typical": {
-                                    "summary": "Typical call",
-                                    "value": example_from_schema(schema) or {}
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        router.routes.append(route)
-
-    def iter_action_kind(schema: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-        """Heuristic: find enum choices for action/verb and kind/resource."""
-        if not isinstance(schema, Dict):
-            return ([], [])
-        props = schema.get("properties", {})
-        # action/verb
-        action_key = next((k for k in ["action", "verb", "operation", "op"] if k in props), None)
-        actions = props.get(action_key, {}).get("enum", []) if action_key else []
-        # kind/resource
-        kind_key = next((k for k in ["kind", "resource", "resources"] if k in props), None)
-        kinds = props.get(kind_key, {}).get("enum", []) if kind_key else []
-        return (actions, kinds)
-
-    def add_granular_routes(router: APIRouter, tool: Dict[str, Any]):
-        """Create /tool/{name}/{action}[/{kind}] for enum’d schemas to simplify prompting."""
-        schema = tool.get("inputSchema") or {"type": "object"}
-        actions, kinds = iter_action_kind(schema)
-        if not actions and not kinds:
-            return  # nothing to expand
-
-        tname = tool["name"]
-        pname = _safe(tname)
-
-        # Build action-only endpoints
-        for action in actions or []:
-            fixed = {"action": action}
-            reduced_schema = strip_fixed_fields(schema, fixed)
-            op_id = f"{tname}_{_safe(action)}"
-
-            async def handler_action(body: Dict[str, Any] = Body(default={}, embed=False), _fixed=fixed) -> Any:
-                args = body or {}
-                args.update(_fixed)
-                return await rpc("tools/call", {"name": tname, "arguments": args})
-
-            ex = example_from_schema(reduced_schema) or {}
-            path = f"/tool/{pname}/{_safe(action)}"
-            route = APIRoute(
-                path=path,
-                endpoint=handler_action,
-                methods=["POST"],
-                name=f"{tname}:{action}",
-                summary=f"{tname} → {action}",
-                description=(f"Convenience endpoint that fixes `action: \"{action}\"`. "
-                             "Provide only the remaining fields in the body."),
-                operation_id=op_id,
-                tags=[tname, action],
-                openapi_extra={
-                    "x-instructions": (
-                        f"Use this when the desired action is '{action}'. "
-                        "Do not include the fixed field `action` in the request body; it is implied by the path."
-                    ),
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": reduced_schema,
-                                "examples": {
-                                    "typical": {"summary": "Typical", "value": ex}
-                                }
-                            }
-                        }
-                    }
-                },
-            )
-            router.routes.append(route)
-
-        # Build action + kind endpoints
-        for action in actions or ["_"]:
-            for kind in kinds or []:
-                if action == "_":  # no action enum, only kind enum
-                    fixed = {"kind": kind}
-                    suffix = _safe(kind)
-                    summary = f"{tname} → {kind}"
-                    desc = f"Fixes `kind: \"{kind}\"`."
-                    tags = [tname, kind]
-                    op_id = f"{tname}_{_safe(kind)}"
-                else:
-                    fixed = {"action": action, "kind": kind}
-                    suffix = f"{_safe(action)}/{_safe(kind)}"
-                    summary = f"{tname} → {action}/{kind}"
-                    desc = f"Fixes `action: \"{action}\"` and `kind: \"{kind}\"`."
-                    tags = [tname, action, kind]
-                    op_id = f"{tname}_{_safe(action)}_{_safe(kind)}"
-
-                reduced_schema = strip_fixed_fields(schema, fixed)
-
-                async def handler_action_kind(body: Dict[str, Any] = Body(default={}, embed=False), _fixed=fixed) -> Any:
-                    args = body or {}
-                    args.update(_fixed)
-                    return await rpc("tools/call", {"name": tname, "arguments": args})
-
-                ex = example_from_schema(reduced_schema) or {}
-                route = APIRoute(
-                    path=f"/tool/{pname}/{suffix}",
-                    endpoint=handler_action_kind,
-                    methods=["POST"],
-                    name=f"{tname}:{summary}",
-                    summary=summary,
-                    description=f"Convenience endpoint. {desc} Provide only remaining fields.",
-                    operation_id=op_id,
-                    tags=tags,
-                    openapi_extra={
-                        "x-instructions": (
-                            "Prefer this endpoint over the generic one when both action and resource kind are known. "
-                            "Omit any fixed fields from the body; they are implied by the path."
-                        ),
-                        "requestBody": {
-                            "required": True,
-                            "content": {
-                                "application/json": {
-                                    "schema": reduced_schema,
-                                    "examples": {
-                                        "typical": {"summary": "Typical", "value": ex}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                )
-                router.routes.append(route)
-
-    # -------------------------
-    # Startup: initialize MCP & build routes
-    # -------------------------
-    @app.on_event("startup")
-    async def startup():
-        deadline = time.time() + STARTUP_TIMEOUT
-        last_err = None
-        while time.time() < deadline:
-            try:
-                await ensure_initialized()
-                tools = await load_tools()
-                router = APIRouter()
-                add_generic_routes(router, tools)
-                # tool-specific
-                for t in tools.values():
-                    add_schema_helpers(router, t)
-                    add_tool_route(router, t)
-                    add_granular_routes(router, t)
-                app.include_router(router)
-                return
-            except Exception as e:
-                last_err = e
-                await asyncio.sleep(1)
-        raise RuntimeError(f"Startup failed: {last_err}")
-
-  requirements.txt: |
-    fastapi==0.114.2
-    uvicorn==0.30.6
-    httpx==0.27.2
----
+# =================================================================
+# === OpenAPI bridge (using your image) — RO
+# =================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -745,37 +348,26 @@ spec:
       labels: { app: mcp-openapi-ro }
     spec:
       serviceAccountName: mcp-server-ro
-      volumes:
-        - name: app
-          emptyDir: {}
-        - name: code
-          configMap:
-            name: mcp-openapi-bridge-code
-            defaultMode: 0444
-      initContainers:
-        - name: prep
-          image: python:3.11-slim
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eux
-              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
-              cp /code/app.py /app/app.py
-          volumeMounts:
-            - { name: code, mountPath: /code, readOnly: true }
-            - { name: app,  mountPath: /app }
       containers:
         - name: bridge
-          image: python:3.11-slim
-          workingDir: /app
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250912-225857
+          imagePullPolicy: IfNotPresent
           env:
             - name: MCP_RPC_URL
               value: "http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp"
+            # To use multi-server mode instead, set MCP_SERVERS, e.g.:
+            # - name: MCP_SERVERS
+            #   value: "ro=http://mcp-server-ro.mcp.svc.cluster.local:8080/mcp"
+            - name: CORS_ALLOW_ORIGINS
+              value: "*"
             - name: STARTUP_TIMEOUT
               value: "30"
-            - name: PYTHONPATH
-              value: "/app:/app/deps"
-          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080","--app-dir","/app"]
+            # Optional if you secured the bridge:
+            # - name: API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: mcp-openapi-keys
+            #       key: api
           ports:
             - name: http
               containerPort: 8080
@@ -790,8 +382,6 @@ spec:
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
-          volumeMounts:
-            - { name: app, mountPath: /app }
 ---
 apiVersion: v1
 kind: Service
@@ -807,6 +397,9 @@ spec:
       port: 8080
       targetPort: http
 ---
+# =================================================================
+# === OpenAPI bridge (using your image) — Admin
+# =================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -822,37 +415,26 @@ spec:
       labels: { app: mcp-openapi-admin }
     spec:
       serviceAccountName: mcp-server-admin
-      volumes:
-        - name: app
-          emptyDir: {}
-        - name: code
-          configMap:
-            name: mcp-openapi-bridge-code
-            defaultMode: 0444
-      initContainers:
-        - name: prep
-          image: python:3.11-slim
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eux
-              python -m pip install --no-cache-dir -r /code/requirements.txt -t /app/deps
-              cp /code/app.py /app/app.py
-          volumeMounts:
-            - { name: code, mountPath: /code, readOnly: true }
-            - { name: app,  mountPath: /app }
       containers:
         - name: bridge
-          image: python:3.11-slim
-          workingDir: /app
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250912-225857
+          imagePullPolicy: IfNotPresent
           env:
             - name: MCP_RPC_URL
               value: "http://mcp-server-admin.mcp.svc.cluster.local:8080/mcp"
+            # Or multi-server in one pod:
+            # - name: MCP_SERVERS
+            #   value: "admin=http://mcp-server-admin.mcp.svc.cluster.local:8080/mcp"
+            - name: CORS_ALLOW_ORIGINS
+              value: "*"
             - name: STARTUP_TIMEOUT
               value: "30"
-            - name: PYTHONPATH
-              value: "/app:/app/deps"
-          command: ["python","-m","uvicorn","app:app","--host","0.0.0.0","--port","8080","--app-dir","/app"]
+            # Optional bridge auth:
+            # - name: API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: mcp-openapi-keys
+            #       key: api
           ports:
             - name: http
               containerPort: 8080
@@ -867,8 +449,6 @@ spec:
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
-          volumeMounts:
-            - { name: app, mountPath: /app }
 ---
 apiVersion: v1
 kind: Service
@@ -883,12 +463,11 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-
-# ======================
-# NetworkPolicy — allow only OpenWebUI + kubelet/node health probes
-# (also allow the OpenAPI bridge pods to reach MCP servers)
-# ======================
 ---
+# ======================
+# NetworkPolicy — allow only OpenWebUI (namespace: ollama) + health probes
+# and allow the OpenAPI bridge pods to reach MCP servers
+# ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -902,7 +481,6 @@ spec:
         values: ["mcp-server-ro","mcp-server-admin"]
   policyTypes: ["Ingress"]
   ingress:
-    # 1) Allow calls from OpenWebUI namespace
     - from:
         - namespaceSelector:
             matchLabels:
@@ -910,7 +488,6 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # 2) Allow same-namespace OpenAPI bridge pods to call MCP servers
     - from:
         - podSelector:
             matchExpressions:
@@ -920,18 +497,16 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
-    # 3) Allow kubelet/node health probes (tighten to your node CIDRs)
     - from:
         - ipBlock:
-            cidr: 0.0.0.0/0   # TODO: replace with your node subnet(s), e.g. 10.0.0.0/8
+            cidr: 0.0.0.0/0   # tighten to your node CIDRs
       ports:
         - protocol: TCP
           port: 8080
-
+---
 # ======================
 # NetworkPolicy — only OpenWebUI may reach the OpenAPI bridges
 # ======================
----
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
