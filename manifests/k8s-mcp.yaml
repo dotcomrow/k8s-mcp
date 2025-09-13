@@ -352,7 +352,7 @@ spec:
       serviceAccountName: mcp-server-ro
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-152103
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-154343
           imagePullPolicy: Always
           env:
             - name: MCP_RPC_URL
@@ -419,7 +419,7 @@ spec:
       serviceAccountName: mcp-server-admin
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-152103
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-154343
           imagePullPolicy: Always
           env:
             - name: MCP_RPC_URL
