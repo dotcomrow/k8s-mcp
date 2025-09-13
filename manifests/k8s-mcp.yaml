@@ -184,7 +184,7 @@ spec:
               mountPath: /mcpbin
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-224650
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-225626
           imagePullPolicy: Always
           env:
             - name: MCP_SERVERS
@@ -325,7 +325,7 @@ spec:
               mountPath: /mcpbin
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-224650
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250913-225626
           imagePullPolicy: Always
           env:
             - name: MCP_SERVERS
