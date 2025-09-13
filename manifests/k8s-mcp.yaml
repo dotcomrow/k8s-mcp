@@ -178,7 +178,7 @@ spec:
             - name: KUBECONFIG
               value: /kube/config
           args:
-            - --transport=streamable-http
+            - --transport=http
             - --host=0.0.0.0
             - --port=8080
             - --access-level=readonly
@@ -291,7 +291,7 @@ spec:
             - name: KUBECONFIG
               value: /kube/config
           args:
-            - --transport=streamable-http
+            - --transport=http
             - --host=0.0.0.0
             - --port=8080
             - --access-level=admin
