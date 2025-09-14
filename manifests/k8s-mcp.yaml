@@ -124,7 +124,7 @@ data:
               key_prefix: mcp
               ttl_seconds: 60
             yugabyte:
-              host: yb-tserver-ysql.yugabyte.svc.cluster.local
+              host: yb-tserver-service.yugabyte.svc.cluster.local
               port: 5433
               database: mcp
               schema: mcp_openapi_ro
@@ -163,7 +163,7 @@ data:
               key_prefix: mcp
               ttl_seconds: 60
             yugabyte:
-              host: yb-tserver-ysql.yugabyte.svc.cluster.local
+              host: yb-tserver-service.yugabyte.svc.cluster.local
               port: 5433
               database: mcp
               schema: mcp_openapi_admin
@@ -211,7 +211,7 @@ spec:
               set -eu
 
               # --- Config ---
-              PGHOST="yb-tserver-ysql.yugabyte.svc.cluster.local"
+              PGHOST="yb-tserver-service.yugabyte.svc.cluster.local"
               PGPORT="5433"
               ADMIN_DB="yugabyte"       # catalog db to check/create target DB
               DB="mcp"
