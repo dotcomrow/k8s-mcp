@@ -100,6 +100,289 @@ subjects:
     name: mcp-server-admin
     namespace: k8s-mcp-service
 ---
+# ======================
+# Driver Config (per-deployment ConfigMaps)
+# ======================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-openapi-ro-driver-config
+  namespace: k8s-mcp-service
+data:
+  driver-manifest.yaml: |
+    apiVersion: mcp.openapi/v1alpha1
+    kind: DriverManifest
+    metadata:
+      name: yugabyte
+    spec:
+      drivers:
+        - name: yugabyte
+          config:
+            redis:
+              url: redis://redis.redis.svc.cluster.local:6379/0
+              namespace: k8s-mcp-service:mcp-openapi-ro
+              key_prefix: mcp
+              ttl_seconds: 60
+            yugabyte:
+              host: yb-tserver-ysql.yugabyte.svc.cluster.local
+              port: 5433
+              database: mcp
+              schema: mcp_openapi_ro
+              sslmode: disable
+              usernameFile: /vault/secrets/yb-username
+              passwordFile: /vault/secrets/yb-password
+              role: mcp_ro
+              pool:
+                min_size: 1
+                max_size: 8
+            bootstrap:
+              create_schema: true
+              run_migrations: true
+            sync:
+              enabled: true
+              interval_seconds: 15
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-openapi-admin-driver-config
+  namespace: k8s-mcp-service
+data:
+  driver-manifest.yaml: |
+    apiVersion: mcp.openapi/v1alpha1
+    kind: DriverManifest
+    metadata:
+      name: yugabyte
+    spec:
+      drivers:
+        - name: yugabyte
+          config:
+            redis:
+              url: redis://redis.redis.svc.cluster.local:6379/0
+              namespace: k8s-mcp-service:mcp-openapi-admin
+              key_prefix: mcp
+              ttl_seconds: 60
+            yugabyte:
+              host: yb-tserver-ysql.yugabyte.svc.cluster.local
+              port: 5433
+              database: mcp
+              schema: mcp_openapi_admin
+              sslmode: disable
+              usernameFile: /vault/secrets/yb-username
+              passwordFile: /vault/secrets/yb-password
+              role: mcp_admin
+              pool:
+                min_size: 1
+                max_size: 8
+            bootstrap:
+              create_schema: true
+              run_migrations: true
+            sync:
+              enabled: true
+              interval_seconds: 10
+---
+# =================================================================
+# Init: Vault + Yugabyte setup for MCP (similar to Keycloak job)
+# =================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mcp-yugabyte-config
+  namespace: vault
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: default
+      volumes:
+        - name: root-token
+          secret:
+            secretName: vault-root-token
+      containers:
+        - name: setup-mcp
+          image: hashicorp/vault:1.15.4
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+
+              # --- Config ---
+              PGHOST="yb-tserver-ysql.yugabyte.svc.cluster.local"
+              PGPORT="5433"
+              ADMIN_DB="yugabyte"       # catalog db to check/create target DB
+              DB="mcp"
+              # Static admin in DB we can use via KV (already managed in your infra)
+              VAULTADMIN_USER="vaultadmin"
+              VAULTADMIN_KV_PATH="secret/vaultadmin"
+
+              # Base role groups; dynamic users will be members of these
+              ROLE_GROUP_RO="mcp_group_ro"
+              ROLE_GROUP_ADMIN="mcp_group_admin"
+
+              # Schemas for the two bridge deployments
+              SCHEMA_RO="mcp_openapi_ro"
+              SCHEMA_ADMIN="mcp_openapi_admin"
+
+              # Vault paths / role names
+              VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
+              DB_MOUNT="yugabyte-db"
+              DB_NAME_IN_VAULT="yugabyte"
+              VAULT_ROLE_RO="mcp-yb-ro"
+              VAULT_ROLE_ADMIN="mcp-yb-admin"
+              K8S_AUTH_ROLE_RO="mcp-yb-ro"
+              K8S_AUTH_ROLE_ADMIN="mcp-yb-admin"
+
+              # K8s SAs that will receive the dynamic creds via Vault Agent
+              SA_RO="mcp-server-ro"
+              SA_ADMIN="mcp-server-admin"
+              SA_NS="k8s-mcp-service"
+
+              apk add --no-cache postgresql15-client jq curl netcat-openbsd
+
+              export PATH="$PATH:/vault-bin"
+              export VAULT_ADDR
+
+              # --- Vault root token from mounted secret ---
+              while [ ! -f /vault-token/VAULT_TOKEN ]; do
+                echo "🔁 Waiting for Vault token file..."
+                sleep 2
+              done
+              export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
+
+              # --- Resolve vaultadmin password from KV ---
+              echo "🔐 Waiting for ${VAULTADMIN_KV_PATH} in Vault..."
+              VAULTADMIN_PASS=""
+              while :; do
+                OUT="$(vault kv get -format=json "${VAULTADMIN_KV_PATH}" 2>/dev/null || true)"
+                if [ -n "${OUT}" ]; then
+                  VAULTADMIN_PASS="$(printf '%s' "$OUT" | jq -r '.data.data.password // .data.data.value // empty')"
+                  if [ -n "${VAULTADMIN_PASS}" ] && [ "${VAULTADMIN_PASS}" != "null" ]; then
+                    break
+                  fi
+                fi
+                echo "⏳ secret not ready; retrying..."
+                sleep 3
+              done
+
+              # --- DB reachability ---
+              until getent hosts "$PGHOST" >/dev/null 2>&1; do echo "🔄 Waiting for DNS $PGHOST..."; sleep 3; done
+              until nc -z -w1 "$PGHOST" "$PGPORT"; do echo "⏳ Waiting for DB $PGHOST:$PGPORT..."; sleep 3; done
+              echo "✅ Yugabyte reachable"
+
+              export PGPASSWORD="$VAULTADMIN_PASS"
+
+              # --- Ensure target DB exists ---
+              DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname='${DB}'" || true)"
+              if [ "$DB_EXISTS" != "1" ]; then
+                echo "📦 Creating DB '${DB}' owned by ${VAULTADMIN_USER}…"
+                createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$DB"
+              else
+                echo "✅ DB '${DB}' exists"
+              fi
+
+              # --- Create role groups & schemas + grants ---
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$DB" <<EOSQL
+              DO \$\$
+              BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE_GROUP_RO}') THEN
+                  CREATE ROLE ${ROLE_GROUP_RO} NOLOGIN;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE_GROUP_ADMIN}') THEN
+                  CREATE ROLE ${ROLE_GROUP_ADMIN} NOLOGIN;
+                END IF;
+              END
+              \$\$;
+
+              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
+              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
+
+              -- Admin: all on both schemas
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
+
+              -- Read-only: select on both schemas
+              GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
+              EOSQL
+
+              echo "✅ Schemas & grants prepared"
+
+              # --- Vault database secrets engine + roles ---
+              if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
+                vault secrets enable -path="${DB_MOUNT}" database
+              fi
+
+              # Dynamic role: read-only
+              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
+                db_name="${DB_NAME_IN_VAULT}" \
+                creation_statements="
+                  CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
+                  GRANT ${ROLE_GROUP_RO} TO \"{{name}}\";
+                " \
+                default_ttl="1h" \
+                max_ttl="24h"
+
+              # Dynamic role: admin
+              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
+                db_name="${DB_NAME_IN_VAULT}" \
+                creation_statements="
+                  CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
+                  GRANT ${ROLE_GROUP_ADMIN} TO \"{{name}}\";
+                " \
+                default_ttl="1h" \
+                max_ttl="24h"
+
+              # --- Policies allowing read of dynamic creds for each bridge ---
+              vault policy write "${VAULT_ROLE_RO}" - <<EOF
+              path "${DB_MOUNT}/creds/${VAULT_ROLE_RO}" { capabilities = ["read"] }
+              EOF
+
+              vault policy write "${VAULT_ROLE_ADMIN}" - <<EOF
+              path "${DB_MOUNT}/creds/${VAULT_ROLE_ADMIN}" { capabilities = ["read"] }
+              EOF
+
+              # --- Kubernetes auth roles bound to the MCP service accounts ---
+              vault write auth/kubernetes/role/${K8S_AUTH_ROLE_RO} \
+                bound_service_account_names="${SA_RO}" \
+                bound_service_account_namespaces="${SA_NS}" \
+                policies="${VAULT_ROLE_RO}" \
+                ttl="24h"
+
+              vault write auth/kubernetes/role/${K8S_AUTH_ROLE_ADMIN} \
+                bound_service_account_names="${SA_ADMIN}" \
+                bound_service_account_namespaces="${SA_NS}" \
+                policies="${VAULT_ROLE_ADMIN}" \
+                ttl="24h"
+
+              echo "🎉 MCP DB, Vault database roles, policies, and K8s auth roles are ready."
+          volumeMounts:
+            - name: root-token
+              mountPath: /vault-token
+              readOnly: true
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "256Mi" }
+---
 # =================================================================
 # === OpenAPI bridge (stdio sidecar pattern) — READ-ONLY
 # =================================================================
@@ -116,6 +399,17 @@ spec:
   template:
     metadata:
       labels: { app: mcp-openapi-ro }
+      annotations:
+        # Vault Agent injector for Yugabyte dynamic creds (read-only role)
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "mcp-yb-ro"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-inject-secret-yb-creds: "database/creds/mcp-yb-ro"
+        vault.hashicorp.com/agent-inject-template-yb-username: |
+          {{- with secret "database/creds/mcp-yb-ro" -}}{{ .Data.username }}{{- end }}
+        vault.hashicorp.com/agent-inject-template-yb-password: |
+          {{- with secret "database/creds/mcp-yb-ro" -}}{{ .Data.password }}{{- end }}
+        vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
       serviceAccountName: mcp-server-ro
       automountServiceAccountToken: true
@@ -130,12 +424,16 @@ spec:
           emptyDir: {}
         - name: mcpbin
           emptyDir: {}
+        - name: driver-config
+          configMap:
+            name: mcp-openapi-ro-driver-config
+            items:
+              - key: driver-manifest.yaml
+                path: driver-manifest.yaml
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
-          securityContext:
-            runAsUser: 0
-            runAsNonRoot: false
+          securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -211,7 +509,6 @@ spec:
               value: "45"
             - name: MCP_STDIO_PREFLIGHT
               value: "1"
-            # Optional: add extra flags for your server startup, e.g. logging
             - name: MCP_STDIO_EXTRA_ARGS
               value: ""
             - name: MCP_SERVERS
@@ -224,6 +521,17 @@ spec:
                     "env": { "KUBECONFIG": "/kube/config" }
                   }
                 ]
+            # Driver system: load the yugabyte driver & point to manifest
+            - name: MCP_DRIVER_MODULES
+              value: "mcp_openapi.drivers.yugabyte_driver"
+            - name: DRIVER_MANIFEST_PATH
+              value: "/etc/mcp/driver-manifest.yaml"
+            # Cache knobs (OpenAPI’s in-process cache for driver data)
+            - name: DRIVER_CACHE_TTL_SECONDS
+              value: "60"
+            - name: DRIVER_CACHE_MAX_WAIT_SECONDS
+              value: "10"
+            # CORS / startup
             - name: CORS_ALLOW_ORIGINS
               value: "*"
             - name: STARTUP_TIMEOUT
@@ -256,6 +564,9 @@ spec:
               mountPath: /kube
             - name: mcpbin
               mountPath: /mcpbin
+            - name: driver-config
+              mountPath: /etc/mcp
+              readOnly: true
 ---
 apiVersion: v1
 kind: Service
@@ -287,6 +598,17 @@ spec:
   template:
     metadata:
       labels: { app: mcp-openapi-admin }
+      annotations:
+        # Vault Agent injector for Yugabyte dynamic creds (admin role)
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "mcp-yb-admin"
+        vault.hashicorp.com/agent-pre-populate-only: "true"
+        vault.hashicorp.com/agent-inject-secret-yb-creds: "database/creds/mcp-yb-admin"
+        vault.hashicorp.com/agent-inject-template-yb-username: |
+          {{- with secret "database/creds/mcp-yb-admin" -}}{{ .Data.username }}{{- end }}
+        vault.hashicorp.com/agent-inject-template-yb-password: |
+          {{- with secret "database/creds/mcp-yb-admin" -}}{{ .Data.password }}{{- end }}
+        vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
       serviceAccountName: mcp-server-admin
       automountServiceAccountToken: true
@@ -301,12 +623,16 @@ spec:
           emptyDir: {}
         - name: mcpbin
           emptyDir: {}
+        - name: driver-config
+          configMap:
+            name: mcp-openapi-admin-driver-config
+            items:
+              - key: driver-manifest.yaml
+                path: driver-manifest.yaml
       initContainers:
         - name: write-kubeconfig
           image: alpine:3.20
-          securityContext:
-            runAsUser: 0
-            runAsNonRoot: false
+          securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -394,6 +720,14 @@ spec:
                     "env": { "KUBECONFIG": "/kube/config" }
                   }
                 ]
+            - name: MCP_DRIVER_MODULES
+              value: "mcp_openapi.drivers.yugabyte_driver"
+            - name: DRIVER_MANIFEST_PATH
+              value: "/etc/mcp/driver-manifest.yaml"
+            - name: DRIVER_CACHE_TTL_SECONDS
+              value: "60"
+            - name: DRIVER_CACHE_MAX_WAIT_SECONDS
+              value: "10"
             - name: CORS_ALLOW_ORIGINS
               value: "*"
             - name: STARTUP_TIMEOUT
@@ -426,6 +760,9 @@ spec:
               mountPath: /kube
             - name: mcpbin
               mountPath: /mcpbin
+            - name: driver-config
+              mountPath: /etc/mcp
+              readOnly: true
 ---
 apiVersion: v1
 kind: Service
@@ -442,7 +779,7 @@ spec:
       targetPort: http
 ---
 # ======================
-# NetworkPolicy — OpenWebUI and kubelet/node may reach the OpenAPI bridges
+# NetworkPolicy — OpenWebUI (ingress) — egress remains open by default
 # ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
