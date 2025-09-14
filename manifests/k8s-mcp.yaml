@@ -187,6 +187,8 @@ spec:
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-011453
           imagePullPolicy: Always
           env:
+            - name: MCP_STDIO_ENABLED
+              value: "1"
             - name: MCP_SERVERS
               value: |
                 [
@@ -328,6 +330,8 @@ spec:
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-011453
           imagePullPolicy: Always
           env:
+            - name: MCP_STDIO_ENABLED
+              value: "1"
             - name: MCP_SERVERS
               value: |
                 [
