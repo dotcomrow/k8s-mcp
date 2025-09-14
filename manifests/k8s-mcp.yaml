@@ -8,6 +8,9 @@ metadata:
     scheduler.alpha.kubernetes.io/node-selector: "dedicated=srvr-node"
     config.linkerd.io/opaque-ports: "5433,8200,443"
 ---
+# ======================
+# Service Accounts
+# ======================
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -20,6 +23,9 @@ metadata:
   name: mcp-server-admin
   namespace: k8s-mcp-service
 ---
+# ======================
+# RBAC
+# ======================
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -94,9 +100,9 @@ subjects:
     name: mcp-server-admin
     namespace: k8s-mcp-service
 ---
-# ======================
-# OpenAPI bridge — READ-ONLY
-# ======================
+# =================================================================
+# === OpenAPI bridge (stdio sidecar pattern) — READ-ONLY
+# =================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -167,9 +173,26 @@ spec:
             - |
               set -eu
               for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod 0755 /mcpbin/mcp-kubernetes && exit 0; fi
+                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
               done
               echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          volumeMounts:
+            - name: mcpbin
+              mountPath: /mcpbin
+        - name: install-kubectl
+          image: bitnami/kubectl:1.29
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eu
+              SRC="/opt/bitnami/kubectl/bin/kubectl"
+              if [ -x "$SRC" ]; then
+                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+              elif command -v kubectl >/dev/null 2>&1; then
+                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+              else
+                echo "kubectl not found in bitnami image" >&2; exit 1
+              fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
@@ -178,11 +201,19 @@ spec:
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-023929
           imagePullPolicy: Always
           env:
+            - name: PATH
+              value: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             - name: MCP_STDIO_ENABLED
               value: "1"
-            # Set to "1" to prefer stdio over HTTP (optional)
-            # - name: MCP_FORCE_STDIO
-            #   value: "1"
+            - name: MCP_FORCE_STDIO
+              value: "1"
+            - name: MCP_STDIO_INIT_TIMEOUT
+              value: "45"
+            - name: MCP_STDIO_PREFLIGHT
+              value: "1"
+            # Optional: add extra flags for your server startup, e.g. logging
+            - name: MCP_STDIO_EXTRA_ARGS
+              value: ""
             - name: MCP_SERVERS
               value: |
                 [
@@ -240,9 +271,9 @@ spec:
       port: 8080
       targetPort: http
 ---
-# ======================
-# OpenAPI bridge — ADMIN
-# ======================
+# =================================================================
+# === OpenAPI bridge (stdio sidecar pattern) — ADMIN
+# =================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -313,9 +344,26 @@ spec:
             - |
               set -eu
               for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod 0755 /mcpbin/mcp-kubernetes && exit 0; fi
+                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
               done
               echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          volumeMounts:
+            - name: mcpbin
+              mountPath: /mcpbin
+        - name: install-kubectl
+          image: bitnami/kubectl:1.29
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eu
+              SRC="/opt/bitnami/kubectl/bin/kubectl"
+              if [ -x "$SRC" ]; then
+                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+              elif command -v kubectl >/dev/null 2>&1; then
+                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+              else
+                echo "kubectl not found in bitnami image" >&2; exit 1
+              fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
@@ -324,10 +372,18 @@ spec:
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-023929
           imagePullPolicy: Always
           env:
+            - name: PATH
+              value: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             - name: MCP_STDIO_ENABLED
               value: "1"
-            # - name: MCP_FORCE_STDIO
-            #   value: "1"
+            - name: MCP_FORCE_STDIO
+              value: "1"
+            - name: MCP_STDIO_INIT_TIMEOUT
+              value: "45"
+            - name: MCP_STDIO_PREFLIGHT
+              value: "1"
+            - name: MCP_STDIO_EXTRA_ARGS
+              value: ""
             - name: MCP_SERVERS
               value: |
                 [
@@ -385,6 +441,9 @@ spec:
       port: 8080
       targetPort: http
 ---
+# ======================
+# NetworkPolicy — OpenWebUI and kubelet/node may reach the OpenAPI bridges
+# ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
