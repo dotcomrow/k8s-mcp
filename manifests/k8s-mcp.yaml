@@ -454,6 +454,7 @@ spec:
       labels: { app: mcp-openapi-ro }
       annotations:
         vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-init-first: "true"
         vault.hashicorp.com/role: "mcp-yb-ro"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
@@ -723,6 +724,7 @@ spec:
       labels: { app: mcp-openapi-admin }
       annotations:
         vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/agent-init-first: "true"
         vault.hashicorp.com/role: "mcp-yb-admin"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
