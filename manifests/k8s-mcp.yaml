@@ -220,6 +220,7 @@ spec:
 
               ROLE_GROUP_RO="mcp_group_ro"
               ROLE_GROUP_ADMIN="mcp_group_admin"
+              ROLE_GROUP_APP="mcp_group_app"
               SCHEMA_RO="mcp_openapi_ro"
               SCHEMA_ADMIN="mcp_openapi_admin"
 
@@ -230,6 +231,7 @@ spec:
               DB_NAME_IN_VAULT="yugabyte"
               VAULT_ROLE_RO="mcp-yb-ro"
               VAULT_ROLE_ADMIN="mcp-yb-admin"
+              VAULT_ROLE_APP="mcp-yb-app"
 
               SA_NS="k8s-mcp-service"
               SA_RO="mcp-server-ro"
@@ -278,8 +280,9 @@ spec:
               }
               ensure_role "${ROLE_GROUP_RO}"
               ensure_role "${ROLE_GROUP_ADMIN}"
+              ensure_role "${ROLE_GROUP_APP}"
 
-              # --- Build SQL (schemas, grants, defaults) into a temp file (no DO blocks) ---
+              # --- Build SQL (schemas, grants, defaults) into a temp file ---
               cat >/tmp/mcp_init.sql <<SQL
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
@@ -296,7 +299,19 @@ spec:
               ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
               ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
 
-              -- Read-only privileges (kept for possible future consumers)
+              -- App group (full RW for tool instances)
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
+
+              -- Read-only privileges (optional; kept for future)
               GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
               GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
               GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
@@ -311,33 +326,46 @@ spec:
 
               # --- Apply SQL atomically; stop on first error ---
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_init.sql
-              echo "✅ Schemas & full grants prepared"
+              echo "✅ Schemas & grants prepared"
 
-              # --- Vault database roles/policies ---
+              # --- Vault database engine + dynamic roles/policies ---
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
 
+              # RO dynamic role (kept for compatibility)
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
                 creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_RO}"' TO "{{name}}";'
 
+              # ADMIN dynamic role (kept for compatibility)
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
                 creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_ADMIN}"' TO "{{name}}";'
 
+              # APP dynamic role (the one pods use)
+              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_APP}" \
+                db_name="${DB_NAME_IN_VAULT}" \
+                default_ttl="1h" \
+                max_ttl="24h" \
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_APP}"' TO "{{name}}";'
+
+              # Policies to read creds
               vault policy write "${VAULT_ROLE_RO}" - <<EOF
               path "${DB_MOUNT}/creds/${VAULT_ROLE_RO}" { capabilities = ["read"] }
               EOF
-
               vault policy write "${VAULT_ROLE_ADMIN}" - <<EOF
               path "${DB_MOUNT}/creds/${VAULT_ROLE_ADMIN}" { capabilities = ["read"] }
               EOF
+              vault policy write "${VAULT_ROLE_APP}" - <<EOF
+              path "${DB_MOUNT}/creds/${VAULT_ROLE_APP}" { capabilities = ["read"] }
+              EOF
 
+              # Kubernetes auth roles
               vault write auth/${AUTH_PATH}/role/${VAULT_ROLE_RO} \
                 bound_service_account_names="${SA_RO}" \
                 bound_service_account_namespaces="${SA_NS}" \
@@ -350,7 +378,14 @@ spec:
                 policies="${VAULT_ROLE_ADMIN}" \
                 ttl="24h"
 
-              echo "🎉 Vault DB engine roles, policies, and k8s auth roles ready."
+              # Unified app role bound to both SAs
+              vault write auth/${AUTH_PATH}/role/${VAULT_ROLE_APP} \
+                bound_service_account_names="${SA_RO},${SA_ADMIN}" \
+                bound_service_account_namespaces="${SA_NS}" \
+                policies="${VAULT_ROLE_APP}" \
+                ttl="24h"
+
+              echo "🎉 Vault DB engine, roles, policies, and k8s auth roles ready."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -360,7 +395,7 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar pattern) — READ-ONLY INSTANCE (full RW DB)
+# === OpenAPI bridge (stdio sidecar) — READ-ONLY INSTANCE (uses full RW DB via app role)
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -380,14 +415,12 @@ spec:
         vault.hashicorp.com/role: "mcp-yb-app"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
-
         vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-username: |
           {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.username }}{{- end }}
         vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-password: |
           {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.password }}{{- end }}
-
         vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
       serviceAccountName: mcp-server-ro
@@ -579,7 +612,7 @@ spec:
       targetPort: http
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar pattern) — ADMIN INSTANCE (full RW DB)
+# === OpenAPI bridge (stdio sidecar) — ADMIN INSTANCE (uses full RW DB via app role)
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -599,14 +632,12 @@ spec:
         vault.hashicorp.com/role: "mcp-yb-app"
         vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
-
         vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-username: |
           {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.username }}{{- end }}
         vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-password: |
           {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.password }}{{- end }}
-
         vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
       serviceAccountName: mcp-server-admin
