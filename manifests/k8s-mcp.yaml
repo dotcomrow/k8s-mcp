@@ -210,12 +210,10 @@ spec:
         - name: setup-mcp
           image: hashicorp/vault:1.15.4
           env:
-            # Toggle once to drop and recreate both schemas if old owners block grants
             - name: RESET_SCHEMAS
-              value: "false"
-            # Optional: superuser creds KV for ownership takeover (username/password)
+              value: "false"   # set to "true" once to drop & recreate schemas
             - name: YSQL_SU_KV_PATH
-              value: "secret/yugabyte-su"
+              value: "secret/yugabyte-su"  # optional superuser takeover KV
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -226,7 +224,6 @@ spec:
               ADMIN_DB="yugabyte"
               APP_DB="mcp"
 
-              # audit/admin operator that connects to DB to manage grants/rotation
               VAULTADMIN_USER="vaultadmin"
               VAULTADMIN_KV_PATH="secret/vaultadmin"
 
@@ -262,7 +259,7 @@ spec:
 
               export PGPASSWORD="$VAULTADMIN_PASS"
 
-              DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'" || true)"
+              DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -Atc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'" || true)"
               if [ "${DB_EXISTS}" != "1" ]; then
                 echo "📦 Creating DB '${APP_DB}' owned by ${VAULTADMIN_USER}…"
                 createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$APP_DB"
@@ -270,14 +267,13 @@ spec:
                 echo "✅ DB '${APP_DB}' exists"
               fi
 
-              # Optionally drop schemas to clear old owners/ACLs
               if [ "${RESET_SCHEMAS}" = "true" ]; then
                 echo "⚠️  RESET_SCHEMAS=true -> dropping schemas ${SCHEMA_RO}, ${SCHEMA_ADMIN}"
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -c "DROP SCHEMA IF EXISTS ${SCHEMA_RO} CASCADE;"
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -c "DROP SCHEMA IF EXISTS ${SCHEMA_ADMIN} CASCADE;"
               fi
 
-              # --- Create static users if missing (NO DO $$; safe for /bin/sh with -u)
+              # Create the two static login roles if missing
               ADMIN_ROLE_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -Atc "SELECT 1 FROM pg_roles WHERE rolname='${USER_ADMIN}'" || true)"
               if [ "${ADMIN_ROLE_EXISTS:-}" != "1" ]; then
                 echo "➕ Creating role ${USER_ADMIN}"
@@ -296,7 +292,13 @@ spec:
                 echo "✅ Role ${USER_RO} exists"
               fi
 
-              # --- Create schemas (owner vaultadmin) & grant equal perms
+              # Make vaultadmin a member so it can run "ALTER DEFAULT PRIVILEGES FOR ROLE …"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                -c "GRANT ${USER_ADMIN} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
+                -c "GRANT ${USER_RO} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
+
+              # Create schemas (owned by vaultadmin) & grant equal perms to both users
               cat >/tmp/mcp_safe.sql <<SQL
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
@@ -311,7 +313,7 @@ spec:
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_safe.sql
               echo "✅ DB & schema-level grants applied"
 
-              # --- Best-effort grants on existing objects (may fail if owned by old dynamic users)
+              # Best-effort grants on existing objects (may fail if owned by old dynamic users)
               cat >/tmp/mcp_best_effort.sql <<SQL
               GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
               GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
@@ -320,8 +322,9 @@ spec:
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -f /tmp/mcp_best_effort.sql || true
 
-              # --- Default privileges so future objects are shared equally
+              # Default privileges for FUTURE objects created by ANY of the three roles
               cat >/tmp/mcp_default_privs.sql <<SQL
+              -- objects created by vaultadmin
               ALTER DEFAULT PRIVILEGES FOR ROLE ${VAULTADMIN_USER} IN SCHEMA ${SCHEMA_RO}
                 GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
               ALTER DEFAULT PRIVILEGES FOR ROLE ${VAULTADMIN_USER} IN SCHEMA ${SCHEMA_ADMIN}
@@ -331,6 +334,7 @@ spec:
               ALTER DEFAULT PRIVILEGES FOR ROLE ${VAULTADMIN_USER} IN SCHEMA ${SCHEMA_ADMIN}
                 GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
 
+              -- objects created by mcp_admin
               ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_ADMIN} IN SCHEMA ${SCHEMA_RO}
                 GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
               ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_ADMIN} IN SCHEMA ${SCHEMA_ADMIN}
@@ -338,6 +342,16 @@ spec:
               ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_ADMIN} IN SCHEMA ${SCHEMA_RO}
                 GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
               ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_ADMIN} IN SCHEMA ${SCHEMA_ADMIN}
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
+
+              -- objects created by mcp_ro (same rights)
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_RO} IN SCHEMA ${SCHEMA_RO}
+                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_RO} IN SCHEMA ${SCHEMA_ADMIN}
+                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_RO} IN SCHEMA ${SCHEMA_RO}
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${USER_RO} IN SCHEMA ${SCHEMA_ADMIN}
                 GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER}, ${USER_ADMIN}, ${USER_RO};
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_default_privs.sql
@@ -346,25 +360,24 @@ spec:
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" \
                 -c "SELECT schemaname, tablename, tableowner FROM pg_catalog.pg_tables WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}') AND tablename='mcp_migrations';" || true
 
-              # --- Optional: take ownership using superuser (no $$ in heredoc)
+              # Optional: superuser takeover to flip ownership of legacy objects
               if vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1; then
                 echo "🔧 Superuser takeover enabled via ${YSQL_SU_KV_PATH}"
                 SU_USER="$(vault kv get -format=json "${YSQL_SU_KV_PATH}" | jq -r '.data.data.username // "yugabyte"')"
                 SU_PASS="$(vault kv get -format=json "${YSQL_SU_KV_PATH}" | jq -r '.data.data.password')"
                 export PGPASSWORD="$SU_PASS"
 
-                # Generate and execute ALTER OWNER statements via \gexec
-                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -Atc \
+                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -Atc \
                   "SELECT 'ALTER TABLE '||quote_ident(schemaname)||'.'||quote_ident(tablename)||' OWNER TO ${USER_ADMIN};'
                      FROM pg_catalog.pg_tables
-                    WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}');" | \
-                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f -
+                    WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}');" \
+                  | psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f -
 
-                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -Atc \
+                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -Atc \
                   "SELECT 'ALTER SEQUENCE '||quote_ident(sequence_schema)||'.'||quote_ident(sequence_name)||' OWNER TO ${USER_ADMIN};'
                      FROM information_schema.sequences
-                    WHERE sequence_schema IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}');" | \
-                psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f -
+                    WHERE sequence_schema IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}');" \
+                  | psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f -
 
                 echo "✅ Ownership set to ${USER_ADMIN}"
                 export PGPASSWORD="$VAULTADMIN_PASS"
@@ -373,7 +386,7 @@ spec:
                 echo "ℹ️ Superuser KV not found; skipping ownership takeover."
               fi
 
-              # ---------- Vault database config (connection + static roles) ----------
+              # Vault: Postgres connection + static users with rotating passwords
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
