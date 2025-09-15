@@ -182,7 +182,7 @@ data:
               interval_seconds: 10
 ---
 # =================================================================
-# Init: Vault + Yugabyte setup (single app role/policy; full RW)
+# Init: Vault + Yugabyte setup (unified app role/policy; full RW)
 # =================================================================
 apiVersion: batch/v1
 kind: Job
@@ -282,8 +282,13 @@ spec:
               ensure_role "${ROLE_GROUP_ADMIN}"
               ensure_role "${ROLE_GROUP_APP}"
 
-              # --- Build SQL (schemas, grants, defaults) into a temp file ---
+              # --- Build SQL (database privileges, schemas, grants) ---
               cat >/tmp/mcp_init.sql <<SQL
+              -- Database-level privileges (required so dynamic users can connect)
+              GRANT CONNECT, TEMP ON DATABASE ${APP_DB} TO ${ROLE_GROUP_ADMIN};
+              GRANT CONNECT, TEMP ON DATABASE ${APP_DB} TO ${ROLE_GROUP_APP};
+              GRANT CONNECT, TEMP ON DATABASE ${APP_DB} TO ${ROLE_GROUP_RO};
+
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
 
@@ -326,28 +331,28 @@ spec:
 
               # --- Apply SQL atomically; stop on first error ---
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_init.sql
-              echo "✅ Schemas & grants prepared"
+              echo "✅ Database, schemas & grants prepared"
 
               # --- Vault database engine + dynamic roles/policies ---
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
 
-              # RO dynamic role (kept for compatibility)
+              # RO dynamic role (compat)
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
                 creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_RO}"' TO "{{name}}";'
 
-              # ADMIN dynamic role (kept for compatibility)
+              # ADMIN dynamic role (compat)
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
                 creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_ADMIN}"' TO "{{name}}";'
 
-              # APP dynamic role (the one pods use)
+              # APP dynamic role (pods use this)
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_APP}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
