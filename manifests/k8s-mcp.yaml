@@ -549,7 +549,11 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
         - name: db-ready-check
-          image: alpine:3.20
+          image: postgres:15-alpine
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0           # init only; avoids any UID issues in the base image
+            allowPrivilegeEscalation: false
           env:
             - name: DB_HOST
               value: "yb-tserver-service.yugabyte.svc.cluster.local"
@@ -563,19 +567,26 @@ spec:
           args:
             - |
               set -euo pipefail
-              apk add --no-cache postgresql15-client netcat-openbsd >/dev/null
+              # wait for Vault-injected creds from the agent
               until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
                 echo "⏳ waiting for Vault creds..."; sleep 2
               done
               export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
               export PGUSER="$(cat /vault/secrets/yb-username)"
               export PGPASSWORD="$(cat /vault/secrets/yb-password)"
-              until nc -z -w1 "${PGHOST}" "${DB_PORT}"; do echo "⏳ waiting for DB..."; sleep 2; done
-              for i in $(seq 1 90); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1 &&
-                   psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q t &&
-                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')" | grep -q t &&
-                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')" | grep -q t
+
+              # wait until DB accepts connections, using psql directly (no nc)
+              for _ in $(seq 1 60); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
+                echo "⏳ waiting for DB to accept connections..."; sleep 2
+              done
+
+              # verify the effective privileges we require
+              for _ in $(seq 1 90); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
                 then
                   echo "✅ DB & privileges ready"; exit 0
                 fi
@@ -807,7 +818,11 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
         - name: db-ready-check
-          image: alpine:3.20
+          image: postgres:15-alpine
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            allowPrivilegeEscalation: false
           env:
             - name: DB_HOST
               value: "yb-tserver-service.yugabyte.svc.cluster.local"
@@ -821,19 +836,23 @@ spec:
           args:
             - |
               set -euo pipefail
-              apk add --no-cache postgresql15-client netcat-openbsd >/dev/null
               until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
                 echo "⏳ waiting for Vault creds..."; sleep 2
               done
               export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
               export PGUSER="$(cat /vault/secrets/yb-username)"
               export PGPASSWORD="$(cat /vault/secrets/yb-password)"
-              until nc -z -w1 "${PGHOST}" "${DB_PORT}"; do echo "⏳ waiting for DB..."; sleep 2; done
-              for i in $(seq 1 90); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1 &&
-                   psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q t &&
-                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')" | grep -q t &&
-                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')" | grep -q t
+
+              for _ in $(seq 1 60); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
+                echo "⏳ waiting for DB to accept connections..."; sleep 2
+              done
+
+              for _ in $(seq 1 90); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
                 then
                   echo "✅ DB & privileges ready"; exit 0
                 fi
