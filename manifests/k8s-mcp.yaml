@@ -238,9 +238,7 @@ spec:
               VAULT_ROLE_ADMIN="mcp-yb-admin"
               VAULT_ROLE_APP="mcp-yb-app"
 
-              # OPTIONAL superuser takeover of existing objects:
-              # Set this to a KV path (e.g., secret/yugabyte-su) containing at least {"password": "..."}.
-              # Optionally include {"username": "yugabyte"}; defaults to "yugabyte" if missing.
+              # OPTIONAL: superuser takeover KV (contains at least {password}; {username} optional, defaults to yugabyte)
               YSQL_SU_KV_PATH="${YSQL_SU_KV_PATH:-secret/yugabyte-su}"
 
               SA_NS="k8s-mcp-service"
@@ -273,8 +271,7 @@ spec:
               fi
 
               ensure_role () {
-                local role="$1"
-                local exists
+                role="$1"
                 exists="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${role}'" || true)"
                 if [ "$exists" != "1" ]; then
                   echo "➕ Creating role ${role}"
@@ -287,64 +284,58 @@ spec:
               ensure_role "${ROLE_GROUP_ADMIN}"
               ensure_role "${ROLE_GROUP_APP}"
 
-              # Make vaultadmin a member of all groups so it can ALTER DEFAULT PRIVILEGES FOR ROLE ...
+              # Let vaultadmin manage default privs FOR ROLE ...
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -c \
                 "GRANT ${ROLE_GROUP_RO}, ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP} TO ${VAULTADMIN_USER};"
 
-              # --- SAFE PART: DB & schema level (fail-fast) --------------------
-              cat >/tmp/mcp_safe.sql <<SQL
-              -- DB-level
-              GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${VAULTADMIN_USER};
-              GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${ROLE_GROUP_APP};
-              GRANT CONNECT ON DATABASE ${APP_DB} TO ${ROLE_GROUP_RO};
+              # --- SAFE: DB & schema level (fail-fast)
+              cat >/tmp/mcp_safe.sql <<'SQL'
+              GRANT ALL PRIVILEGES ON DATABASE mcp TO vaultadmin;
+              GRANT ALL PRIVILEGES ON DATABASE mcp TO mcp_group_admin;
+              GRANT ALL PRIVILEGES ON DATABASE mcp TO mcp_group_app;
+              GRANT CONNECT ON DATABASE mcp TO mcp_group_ro;
 
-              -- Schemas owned by vaultadmin
-              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
-              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
+              CREATE SCHEMA IF NOT EXISTS mcp_openapi_ro    AUTHORIZATION vaultadmin;
+              CREATE SCHEMA IF NOT EXISTS mcp_openapi_admin AUTHORIZATION vaultadmin;
 
-              -- Schema usage/create
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP}, ${VAULTADMIN_USER};
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP}, ${VAULTADMIN_USER};
+              GRANT USAGE, CREATE ON SCHEMA mcp_openapi_ro    TO mcp_group_admin, mcp_group_app, vaultadmin;
+              GRANT USAGE, CREATE ON SCHEMA mcp_openapi_admin TO mcp_group_admin, mcp_group_app, vaultadmin;
 
-              -- Read-only schema access
-              GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT USAGE ON SCHEMA mcp_openapi_ro    TO mcp_group_ro;
+              GRANT USAGE ON SCHEMA mcp_openapi_admin TO mcp_group_ro;
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_safe.sql
               echo "✅ DB & schema-level grants applied"
 
-              # --- BEST-EFFORT: existing objects (won't fail the job) ----------
-              cat >/tmp/mcp_best_effort.sql <<SQL
-              -- Give vaultadmin full on existing objects (may fail if not owner)
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${VAULTADMIN_USER};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${VAULTADMIN_USER};
+              # --- BEST-EFFORT: existing objects (will fail if not owner; OK)
+              cat >/tmp/mcp_best_effort.sql <<'SQL'
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO vaultadmin;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO vaultadmin;
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_admin TO vaultadmin;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_admin TO vaultadmin;
 
-              -- Existing objects to groups (as before)
-              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO mcp_group_ro;
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO mcp_group_ro;
+              GRANT SELECT ON ALL TABLES    IN SCHEMA mcp_openapi_admin TO mcp_group_ro;
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA mcp_openapi_admin TO mcp_group_ro;
 
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO mcp_group_admin, mcp_group_app;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO mcp_group_admin, mcp_group_app;
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_admin TO mcp_group_admin, mcp_group_app;
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_admin TO mcp_group_admin, mcp_group_app;
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -f /tmp/mcp_best_effort.sql || true
 
-              # --- DEFAULT PRIVS for future objects (now valid since membership) -
-              cat >/tmp/mcp_default_privs.sql <<SQL
-              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_RO}
-                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER};
-              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_ADMIN}
-                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER};
-              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_RO}
-                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER};
-              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_ADMIN}
-                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER};
+              # --- DEFAULT PRIVS for future objects (works now that vaultadmin is a member)
+              cat >/tmp/mcp_default_privs.sql <<'SQL'
+              ALTER DEFAULT PRIVILEGES FOR ROLE mcp_group_app IN SCHEMA mcp_openapi_ro
+                GRANT ALL PRIVILEGES ON TABLES TO vaultadmin;
+              ALTER DEFAULT PRIVILEGES FOR ROLE mcp_group_app IN SCHEMA mcp_openapi_admin
+                GRANT ALL PRIVILEGES ON TABLES TO vaultadmin;
+              ALTER DEFAULT PRIVILEGES FOR ROLE mcp_group_app IN SCHEMA mcp_openapi_ro
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO vaultadmin;
+              ALTER DEFAULT PRIVILEGES FOR ROLE mcp_group_app IN SCHEMA mcp_openapi_admin
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO vaultadmin;
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_default_privs.sql
 
@@ -352,51 +343,48 @@ spec:
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -c \
                 "SELECT schemaname, tablename, tableowner
                    FROM pg_catalog.pg_tables
-                  WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}')
+                  WHERE schemaname IN ('mcp_openapi_ro','mcp_openapi_admin')
                     AND tablename IN ('mcp_migrations');" || true
 
-              # --- OPTIONAL: Superuser takeover of ownership --------------------
-              # If the KV path exists, connect as superuser and fix owners to vaultadmin.
+              # --- OPTIONAL: Superuser takeover (if KV exists)
               if vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1; then
                 echo "🔧 Superuser takeover enabled via ${YSQL_SU_KV_PATH}"
                 SU_USER="$(vault kv get -format=json "${YSQL_SU_KV_PATH}" | jq -r '.data.data.username // "yugabyte"')"
                 SU_PASS="$(vault kv get -format=json "${YSQL_SU_KV_PATH}" | jq -r '.data.data.password')"
                 export PGPASSWORD="$SU_PASS"
-                cat >/tmp/mcp_takeover.sql <<SQL
+
+                cat >/tmp/mcp_takeover.sql <<'SQL'
                 DO $$
                 DECLARE r record;
                 BEGIN
-                  -- Tables
                   FOR r IN
                     SELECT format('%I.%I', schemaname, tablename) AS rel
                     FROM pg_catalog.pg_tables
-                    WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}')
-                      AND tableowner <> '${VAULTADMIN_USER}'
+                    WHERE schemaname IN ('mcp_openapi_ro','mcp_openapi_admin')
                   LOOP
-                    EXECUTE format('ALTER TABLE %s OWNER TO %I', r.rel, '${VAULTADMIN_USER}');
+                    EXECUTE format('ALTER TABLE %s OWNER TO %I', r.rel, 'vaultadmin');
                   END LOOP;
 
-                  -- Sequences
                   FOR r IN
                     SELECT format('%I.%I', sequence_schema, sequence_name) AS rel
                     FROM information_schema.sequences
-                    WHERE sequence_schema IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}')
+                    WHERE sequence_schema IN ('mcp_openapi_ro','mcp_openapi_admin')
                   LOOP
-                    EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', r.rel, '${VAULTADMIN_USER}');
+                    EXECUTE format('ALTER SEQUENCE %s OWNER TO %I', r.rel, 'vaultadmin');
                   END LOOP;
                 END$$;
                 SQL
                 psql -h "$PGHOST" -p "$PGPORT" -U "$SU_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_takeover.sql
-                echo "✅ Ownership of objects in ${SCHEMA_RO}, ${SCHEMA_ADMIN} changed to ${VAULTADMIN_USER}"
+                echo "✅ Ownership in mcp_openapi_ro & mcp_openapi_admin set to vaultadmin"
 
-                # After takeover, re-apply grants cleanly as vaultadmin
+                # Re-apply grants cleanly as vaultadmin
                 export PGPASSWORD="$VAULTADMIN_PASS"
                 psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_best_effort.sql
               else
-                echo "ℹ️ Superuser KV ${YSQL_SU_KV_PATH} not found; skipping ownership takeover."
+                echo "ℹ️ Superuser KV not found; skipping ownership takeover."
               fi
 
-              # --- Vault DB engine & roles -------------------------------------
+              # --- Vault DB engine & roles
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
@@ -447,7 +435,7 @@ spec:
                 policies="${VAULT_ROLE_APP}" \
                 ttl="24h"
 
-              echo "🎉 Vault DB engine ready. vaultadmin has full DB/schema rights; default-privs set; ownership takeover $(vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1 && echo enabled || echo skipped)."
+              echo "🎉 Setup complete."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
