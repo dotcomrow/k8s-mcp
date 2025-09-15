@@ -101,7 +101,7 @@ subjects:
     namespace: k8s-mcp-service
 ---
 # ======================
-# Driver Config (per-deployment ConfigMaps)
+# Driver Configs (per-deployment)
 # ======================
 apiVersion: v1
 kind: ConfigMap
@@ -131,7 +131,7 @@ data:
               sslmode: disable
               usernameFile: /vault/secrets/yb-username
               passwordFile: /vault/secrets/yb-password
-              role: mcp_ro
+              role: mcp_group_app
               pool:
                 min_size: 1
                 max_size: 8
@@ -170,7 +170,7 @@ data:
               sslmode: disable
               usernameFile: /vault/secrets/yb-username
               passwordFile: /vault/secrets/yb-password
-              role: mcp_admin
+              role: mcp_group_app
               pool:
                 min_size: 1
                 max_size: 8
@@ -182,7 +182,7 @@ data:
               interval_seconds: 10
 ---
 # =================================================================
-# Init: Vault + Yugabyte setup for MCP (DB engine, connection, roles, policies)
+# Init: Vault + Yugabyte setup (single app role/policy; full RW)
 # =================================================================
 apiVersion: batch/v1
 kind: Job
@@ -209,6 +209,7 @@ spec:
           args:
             - |
               set -eu
+              apk add --no-cache postgresql15-client jq curl netcat-openbsd
 
               PGHOST="yb-tserver-service.yugabyte.svc.cluster.local"
               PGPORT="5433"
@@ -217,8 +218,7 @@ spec:
               VAULTADMIN_USER="vaultadmin"
               VAULTADMIN_KV_PATH="secret/vaultadmin"
 
-              ROLE_GROUP_RO="mcp_group_ro"
-              ROLE_GROUP_ADMIN="mcp_group_admin"
+              ROLE_GROUP_APP="mcp_group_app"
               SCHEMA_RO="mcp_openapi_ro"
               SCHEMA_ADMIN="mcp_openapi_admin"
 
@@ -227,45 +227,32 @@ spec:
 
               DB_MOUNT="yugabyte-db"
               DB_NAME_IN_VAULT="yugabyte"
-              VAULT_ROLE_RO="mcp-yb-ro"
-              VAULT_ROLE_ADMIN="mcp-yb-admin"
+              VAULT_ROLE_APP="mcp-yb-app"
 
               SA_NS="k8s-mcp-service"
               SA_RO="mcp-server-ro"
               SA_ADMIN="mcp-server-admin"
 
-              apk add --no-cache postgresql15-client jq curl netcat-openbsd
-              export PATH="$PATH:/vault-bin"
-              export VAULT_ADDR
+              export PATH="$PATH:/vault-bin" VAULT_ADDR
 
-              until [ -s /vault-token/VAULT_TOKEN ]; do echo "🔁 waiting for /vault-token/VAULT_TOKEN..."; sleep 2; done
+              until [ -s /vault-token/VAULT_TOKEN ]; do sleep 1; done
               export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
 
-              echo "🔐 Fetching ${VAULTADMIN_KV_PATH}..."
-              VAULTADMIN_PASS="$(vault kv get -format=json "${VAULTADMIN_KV_PATH}" | jq -r '.data.data.password // .data.data.value')"
+              VAULTADMIN_PASS="$(vault kv get -format=json "${VAULTADMIN_KV_PATH}" \
+                | jq -r '.data.data.password // .data.data.value')"
 
-              until getent hosts "$PGHOST" >/dev/null 2>&1; do echo "🔄 waiting for DNS $PGHOST..."; sleep 3; done
-              until nc -z -w1 "$PGHOST" "$PGPORT"; do echo "⏳ waiting for DB $PGHOST:$PGPORT..."; sleep 3; done
-              echo "✅ Yugabyte reachable"
-
+              until getent hosts "$PGHOST" >/dev/null 2>&1; do sleep 2; done
+              until nc -z -w1 "$PGHOST" "$PGPORT"; do sleep 2; done
               export PGPASSWORD="$VAULTADMIN_PASS"
 
               DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -tAc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'" || true)"
-              if [ "$DB_EXISTS" != "1" ]; then
-                echo "📦 Creating DB '${APP_DB}' owned by ${VAULTADMIN_USER}…"
-                createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$APP_DB"
-              else
-                echo "✅ DB '${APP_DB}' exists"
-              fi
+              [ "$DB_EXISTS" = "1" ] || createdb -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -O "$VAULTADMIN_USER" "$APP_DB"
 
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" <<EOSQL
               DO \$\$
               BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE_GROUP_RO}') THEN
-                  CREATE ROLE ${ROLE_GROUP_RO} NOLOGIN;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE_GROUP_ADMIN}') THEN
-                  CREATE ROLE ${ROLE_GROUP_ADMIN} NOLOGIN;
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE_GROUP_APP}') THEN
+                  CREATE ROLE ${ROLE_GROUP_APP} NOLOGIN;
                 END IF;
               END
               \$\$;
@@ -273,74 +260,44 @@ spec:
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
 
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
 
-              GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
-              EOSQL
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
 
-              echo "✅ Schemas & grants prepared"
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
 
-              if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
-                vault secrets enable -path="${DB_MOUNT}" database
-              fi
+              echo "✅ Schemas & full grants prepared"
 
-              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
+              vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1 \
+                || vault secrets enable -path="${DB_MOUNT}" database
+
+              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_APP}" \
                 db_name="${DB_NAME_IN_VAULT}" \
-                default_ttl="1h" \
-                max_ttl="24h" \
+                default_ttl="12h" \
+                max_ttl="72h" \
                 creation_statements="
                   CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
-                  GRANT ${ROLE_GROUP_RO} TO \"{{name}}\";
+                  GRANT ${ROLE_GROUP_APP} TO \"{{name}}\";
                 "
 
-              vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
-                db_name="${DB_NAME_IN_VAULT}" \
-                default_ttl="1h" \
-                max_ttl="24h" \
-                creation_statements="
-                  CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}';
-                  GRANT ${ROLE_GROUP_ADMIN} TO \"{{name}}\";
-                "
-
-              vault policy write "${VAULT_ROLE_RO}" - <<EOF
-              path "${DB_MOUNT}/creds/${VAULT_ROLE_RO}" { capabilities = ["read"] }
+              vault policy write "${VAULT_ROLE_APP}" - <<EOF
+              path "${DB_MOUNT}/creds/${VAULT_ROLE_APP}" { capabilities = ["read"] }
               EOF
 
-              vault policy write "${VAULT_ROLE_ADMIN}" - <<EOF
-              path "${DB_MOUNT}/creds/${VAULT_ROLE_ADMIN}" { capabilities = ["read"] }
-              EOF
-
-              vault write auth/${AUTH_PATH}/role/${VAULT_ROLE_RO} \
-                bound_service_account_names="${SA_RO}" \
+              vault write "auth/${AUTH_PATH}/role/${VAULT_ROLE_APP}" \
+                bound_service_account_names="${SA_RO},${SA_ADMIN}" \
                 bound_service_account_namespaces="${SA_NS}" \
-                policies="${VAULT_ROLE_RO}" \
+                policies="${VAULT_ROLE_APP}" \
                 ttl="24h"
 
-              vault write auth/${AUTH_PATH}/role/${VAULT_ROLE_ADMIN} \
-                bound_service_account_names="${SA_ADMIN}" \
-                bound_service_account_namespaces="${SA_NS}" \
-                policies="${VAULT_ROLE_ADMIN}" \
-                ttl="24h"
-
-              echo "🎉 Vault DB engine, connection, roles, policies, and k8s auth roles ready."
+              echo "🎉 Single-role setup complete: ${VAULT_ROLE_APP}"
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -350,7 +307,7 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar pattern) — READ-ONLY
+# === OpenAPI bridge (stdio sidecar pattern) — READ-ONLY INSTANCE (full RW DB)
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -367,16 +324,16 @@ spec:
       labels: { app: mcp-openapi-ro }
       annotations:
         vault.hashicorp.com/agent-inject: "true"
-        vault.hashicorp.com/role: "mcp-yb-ro"
-        vault.hashicorp.com/auth-path: "auth/kubernetes"   # ← fixed
+        vault.hashicorp.com/role: "mcp-yb-app"
+        vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
 
-        vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-ro"
+        vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-username: |
-          {{- with secret "yugabyte-db/creds/mcp-yb-ro" -}}{{ .Data.username }}{{- end }}
-        vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-ro"
+          {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.username }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-password: |
-          {{- with secret "yugabyte-db/creds/mcp-yb-ro" -}}{{ .Data.password }}{{- end }}
+          {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.password }}{{- end }}
 
         vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
@@ -404,68 +361,65 @@ spec:
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
-              done
-              echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          args: |
+            set -eu
+            for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
+              if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
+            done
+            echo "mcp-kubernetes binary not found in image" >&2; exit 1
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
         - name: install-kubectl
           image: bitnami/kubectl:1.29
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              SRC="/opt/bitnami/kubectl/bin/kubectl"
-              if [ -x "$SRC" ]; then
-                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              elif command -v kubectl >/dev/null 2>&1; then
-                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              else
-                echo "kubectl not found in bitnami image" >&2; exit 1
-              fi
+          args: |
+            set -eu
+            SRC="/opt/bitnami/kubectl/bin/kubectl"
+            if [ -x "$SRC" ]; then
+              cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            elif command -v kubectl >/dev/null 2>&1; then
+              cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            else
+              echo "kubectl not found in bitnami image" >&2; exit 1
+            fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-235013
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
           imagePullPolicy: Always
           env:
             - name: PATH
@@ -502,6 +456,26 @@ spec:
               value: "*"
             - name: STARTUP_TIMEOUT
               value: "30"
+            - name: RUN_MIGRATIONS
+              value: "1"
+            - name: DB_HOST
+              value: "yb-tserver-service.yugabyte.svc.cluster.local"
+            - name: DB_PORT
+              value: "5433"
+            - name: DB_NAME
+              value: "mcp"
+            - name: DB_SCHEMA
+              value: "mcp_openapi_ro"
+            - name: DB_SSLMODE
+              value: "disable"
+            - name: DB_USER_FILE
+              value: "/vault/secrets/yb-username"
+            - name: DB_PASS_FILE
+              value: "/vault/secrets/yb-password"
+            - name: DB_MIGRATIONS_DIR
+              value: "/app/migrations"
+            - name: DB_SEEDS_DIR
+              value: "/app/seeds"
           ports:
             - name: http
               containerPort: 8080
@@ -549,7 +523,7 @@ spec:
       targetPort: http
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar pattern) — ADMIN
+# === OpenAPI bridge (stdio sidecar pattern) — ADMIN INSTANCE (full RW DB)
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -566,16 +540,16 @@ spec:
       labels: { app: mcp-openapi-admin }
       annotations:
         vault.hashicorp.com/agent-inject: "true"
-        vault.hashicorp.com/role: "mcp-yb-admin"
-        vault.hashicorp.com/auth-path: "auth/kubernetes"   # ← fixed
+        vault.hashicorp.com/role: "mcp-yb-app"
+        vault.hashicorp.com/auth-path: "auth/kubernetes"
         vault.hashicorp.com/agent-pre-populate-only: "true"
 
-        vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-admin"
+        vault.hashicorp.com/agent-inject-secret-yb-username: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-username: |
-          {{- with secret "yugabyte-db/creds/mcp-yb-admin" -}}{{ .Data.username }}{{- end }}
-        vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-admin"
+          {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.username }}{{- end }}
+        vault.hashicorp.com/agent-inject-secret-yb-password: "yugabyte-db/creds/mcp-yb-app"
         vault.hashicorp.com/agent-inject-template-yb-password: |
-          {{- with secret "yugabyte-db/creds/mcp-yb-admin" -}}{{ .Data.password }}{{- end }}
+          {{- with secret "yugabyte-db/creds/mcp-yb-app" -}}{{ .Data.password }}{{- end }}
 
         vault.hashicorp.com/secret-volume-path: "/vault/secrets"
     spec:
@@ -603,68 +577,65 @@ spec:
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
-              done
-              echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          args: |
+            set -eu
+            for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
+              if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
+            done
+            echo "mcp-kubernetes binary not found in image" >&2; exit 1
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
         - name: install-kubectl
           image: bitnami/kubectl:1.29
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              SRC="/opt/bitnami/kubectl/bin/kubectl"
-              if [ -x "$SRC" ]; then
-                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              elif command -v kubectl >/dev/null 2>&1; then
-                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              else
-                echo "kubectl not found in bitnami image" >&2; exit 1
-              fi
+          args: |
+            set -eu
+            SRC="/opt/bitnami/kubectl/bin/kubectl"
+            if [ -x "$SRC" ]; then
+              cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            elif command -v kubectl >/dev/null 2>&1; then
+              cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            else
+              echo "kubectl not found in bitnami image" >&2; exit 1
+            fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250914-235013
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
           imagePullPolicy: Always
           env:
             - name: PATH
@@ -701,6 +672,26 @@ spec:
               value: "*"
             - name: STARTUP_TIMEOUT
               value: "30"
+            - name: RUN_MIGRATIONS
+              value: "1"
+            - name: DB_HOST
+              value: "yb-tserver-service.yugabyte.svc.cluster.local"
+            - name: DB_PORT
+              value: "5433"
+            - name: DB_NAME
+              value: "mcp"
+            - name: DB_SCHEMA
+              value: "mcp_openapi_admin"
+            - name: DB_SSLMODE
+              value: "disable"
+            - name: DB_USER_FILE
+              value: "/vault/secrets/yb-username"
+            - name: DB_PASS_FILE
+              value: "/vault/secrets/yb-password"
+            - name: DB_MIGRATIONS_DIR
+              value: "/app/migrations"
+            - name: DB_SEEDS_DIR
+              value: "/app/seeds"
           ports:
             - name: http
               containerPort: 8080
