@@ -186,7 +186,7 @@ data:
               interval_seconds: 10
 ---
 # =================================================================
-# Init: Vault + Yugabyte setup (unified app role/policy; full RW) — wave 0
+# Init: Vault + Yugabyte setup (vaultadmin full access + optional takeover) — wave 0
 # =================================================================
 apiVersion: batch/v1
 kind: Job
@@ -284,7 +284,7 @@ spec:
               ensure_role "${ROLE_GROUP_ADMIN}"
               ensure_role "${ROLE_GROUP_APP}"
 
-              # Let vaultadmin manage default privs FOR ROLE ...
+              # Allow vaultadmin to set default privs FOR ROLE ...
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -c \
                 "GRANT ${ROLE_GROUP_RO}, ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP} TO ${VAULTADMIN_USER};"
 
@@ -307,7 +307,7 @@ spec:
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_safe.sql
               echo "✅ DB & schema-level grants applied"
 
-              # --- BEST-EFFORT: existing objects (will fail if not owner; OK)
+              # --- BEST-EFFORT: existing objects (may fail if not owner)
               cat >/tmp/mcp_best_effort.sql <<'SQL'
               GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO vaultadmin;
               GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO vaultadmin;
@@ -326,7 +326,7 @@ spec:
               SQL
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -f /tmp/mcp_best_effort.sql || true
 
-              # --- DEFAULT PRIVS for future objects (works now that vaultadmin is a member)
+              # --- DEFAULT PRIVS for future objects (now valid since vaultadmin is a member)
               cat >/tmp/mcp_default_privs.sql <<'SQL'
               ALTER DEFAULT PRIVILEGES FOR ROLE mcp_group_app IN SCHEMA mcp_openapi_ro
                 GRANT ALL PRIVILEGES ON TABLES TO vaultadmin;
@@ -463,7 +463,11 @@ spec:
                 policies="${VAULT_ROLE_APP}" \
                 ttl="24h"
 
-              echo "🎉 Setup complete. (Superuser takeover $(vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1 && echo enabled || echo skipped))"
+              TAKEOVER_STATUS="skipped"
+              if vault kv get -format=json "${YSQL_SU_KV_PATH}" >/dev/null 2>&1; then
+                TAKEOVER_STATUS="enabled"
+              fi
+              echo "🎉 Setup complete. (Superuser takeover ${TAKEOVER_STATUS})"
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -523,6 +527,7 @@ spec:
               - key: driver-manifest.yaml
                 path: driver-manifest.yaml
       initContainers:
+        # Wait for kubeconfig
         - name: write-kubeconfig
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
