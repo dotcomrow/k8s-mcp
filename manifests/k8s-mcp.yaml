@@ -235,8 +235,7 @@ spec:
               SA_RO="mcp-server-ro"
               SA_ADMIN="mcp-server-admin"
 
-              apk update >/dev/null 2>&1 || true
-              apk add --no-cache postgresql15-client jq curl netcat-openbsd
+              apk add --no-cache postgresql15-client jq curl netcat-openbsd >/dev/null
 
               export PATH="$PATH:/vault-bin"
               export VAULT_ADDR
@@ -265,71 +264,72 @@ spec:
                 echo "✅ DB '${APP_DB}' exists"
               fi
 
-              # --- Build SQL into a temp file (quoted here-doc to avoid expansion) ---
-              cat >/tmp/mcp_init.sql <<'SQL'
-              DO $$
-              BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mcp_group_ro') THEN
-                  CREATE ROLE mcp_group_ro NOLOGIN;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mcp_group_admin') THEN
-                  CREATE ROLE mcp_group_admin NOLOGIN;
-                END IF;
-              END
-              $$;
+              # --- Ensure roles exist (no DO $$ … $$) ---
+              ensure_role () {
+                local role="$1"
+                local exists
+                exists="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${role}'" || true)"
+                if [ "$exists" != "1" ]; then
+                  echo "➕ Creating role ${role}"
+                  psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -c "CREATE ROLE ${role} NOLOGIN;"
+                else
+                  echo "✅ Role ${role} exists"
+                fi
+              }
+              ensure_role "${ROLE_GROUP_RO}"
+              ensure_role "${ROLE_GROUP_ADMIN}"
 
-              CREATE SCHEMA IF NOT EXISTS mcp_openapi_ro    AUTHORIZATION vaultadmin;
-              CREATE SCHEMA IF NOT EXISTS mcp_openapi_admin AUTHORIZATION vaultadmin;
+              # --- Build SQL (schemas, grants, defaults) into a temp file (no DO blocks) ---
+              cat >/tmp/mcp_init.sql <<SQL
+              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
+              CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
 
               -- Admin privileges (full)
-              GRANT USAGE, CREATE ON SCHEMA mcp_openapi_ro    TO mcp_group_admin;
-              GRANT USAGE, CREATE ON SCHEMA mcp_openapi_admin TO mcp_group_admin;
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO mcp_group_admin;
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO mcp_group_admin;
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA mcp_openapi_admin TO mcp_group_admin;
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA mcp_openapi_admin TO mcp_group_admin;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_ro    GRANT ALL ON TABLES    TO mcp_group_admin;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_ro    GRANT ALL ON SEQUENCES TO mcp_group_admin;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_admin GRANT ALL ON TABLES    TO mcp_group_admin;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_admin GRANT ALL ON SEQUENCES TO mcp_group_admin;
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
 
-              -- Read-only privileges (kept for future use)
-              GRANT USAGE ON SCHEMA mcp_openapi_ro    TO mcp_group_ro;
-              GRANT USAGE ON SCHEMA mcp_openapi_admin TO mcp_group_ro;
-              GRANT SELECT ON ALL TABLES    IN SCHEMA mcp_openapi_ro    TO mcp_group_ro;
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA mcp_openapi_ro    TO mcp_group_ro;
-              GRANT SELECT ON ALL TABLES    IN SCHEMA mcp_openapi_admin TO mcp_group_ro;
-              GRANT SELECT ON ALL SEQUENCES IN SCHEMA mcp_openapi_admin TO mcp_group_ro;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_ro    GRANT SELECT ON TABLES    TO mcp_group_ro;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_ro    GRANT SELECT ON SEQUENCES TO mcp_group_ro;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_admin GRANT SELECT ON TABLES    TO mcp_group_ro;
-              ALTER DEFAULT PRIVILEGES IN SCHEMA mcp_openapi_admin GRANT SELECT ON SEQUENCES TO mcp_group_ro;
+              -- Read-only privileges (kept for possible future consumers)
+              GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
+              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
               SQL
 
-              # --- Apply SQL atomically; stop on errors ---
+              # --- Apply SQL atomically; stop on first error ---
               psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_init.sql
               echo "✅ Schemas & full grants prepared"
 
-              # --- Vault database roles/policies (outside psql) ---
+              # --- Vault database roles/policies ---
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
 
-              # Dynamic role: read-only → member of mcp_group_ro
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
-                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT mcp_group_ro TO "{{name}}";'
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_RO}"' TO "{{name}}";'
 
-              # Dynamic role: admin → member of mcp_group_admin
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
-                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT mcp_group_admin TO "{{name}}";'
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_ADMIN}"' TO "{{name}}";'
 
-              # Policies to read creds
               vault policy write "${VAULT_ROLE_RO}" - <<EOF
               path "${DB_MOUNT}/creds/${VAULT_ROLE_RO}" { capabilities = ["read"] }
               EOF
@@ -338,7 +338,6 @@ spec:
               path "${DB_MOUNT}/creds/${VAULT_ROLE_ADMIN}" { capabilities = ["read"] }
               EOF
 
-              # Bind K8s SAs to Vault policies
               vault write auth/${AUTH_PATH}/role/${VAULT_ROLE_RO} \
                 bound_service_account_names="${SA_RO}" \
                 bound_service_account_namespaces="${SA_NS}" \
