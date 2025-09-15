@@ -101,13 +101,15 @@ subjects:
     namespace: k8s-mcp-service
 ---
 # ======================
-# Driver Configs (per-deployment)
+# Driver Configs (per-deployment) — wave 0
 # ======================
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mcp-openapi-ro-driver-config
   namespace: k8s-mcp-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 data:
   driver-manifest.yaml: |
     apiVersion: mcp.openapi/v1alpha1
@@ -147,6 +149,8 @@ kind: ConfigMap
 metadata:
   name: mcp-openapi-admin-driver-config
   namespace: k8s-mcp-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 data:
   driver-manifest.yaml: |
     apiVersion: mcp.openapi/v1alpha1
@@ -182,13 +186,15 @@ data:
               interval_seconds: 10
 ---
 # =================================================================
-# Init: Vault + Yugabyte setup (unified app role/policy; full RW)
+# Init: Vault + Yugabyte setup (unified app role/policy; full RW) — wave 0
 # =================================================================
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: mcp-yugabyte-config
   namespace: vault
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   backoffLimit: 0
   template:
@@ -385,7 +391,7 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar) — READ-ONLY INSTANCE (uses full RW DB via app role)
+# === OpenAPI bridge (stdio sidecar) — READ-ONLY INSTANCE — wave 1
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -393,6 +399,8 @@ metadata:
   name: mcp-openapi-ro
   namespace: k8s-mcp-service
   labels: { app: mcp-openapi-ro }
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   replicas: 1
   selector:
@@ -433,6 +441,7 @@ spec:
               - key: driver-manifest.yaml
                 path: driver-manifest.yaml
       initContainers:
+        # Wait for kubeconfig (unchanged)
         - name: write-kubeconfig
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
@@ -466,6 +475,7 @@ spec:
           volumeMounts:
             - name: kube
               mountPath: /kube
+        # MCP binaries (unchanged)
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
@@ -496,6 +506,49 @@ spec:
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
+        # NEW: block until DB & privileges are ready
+        - name: db-ready-check
+          image: alpine:3.20
+          env:
+            - name: DB_HOST
+              value: "yb-tserver-service.yugabyte.svc.cluster.local"
+            - name: DB_PORT
+              value: "5433"
+            - name: DB_NAME
+              value: "mcp"
+            - name: DB_SCHEMA
+              value: "mcp_openapi_ro"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              apk add --no-cache postgresql15-client netcat-openbsd >/dev/null
+              # wait for Vault-injected creds
+              until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
+                echo "⏳ waiting for Vault creds..."; sleep 2
+              done
+              export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
+              export PGUSER="$(cat /vault/secrets/yb-username)"
+              export PGPASSWORD="$(cat /vault/secrets/yb-password)"
+              # wait for DB socket
+              until nc -z -w1 "${PGHOST}" "${PGPORT}"; do echo "⏳ waiting for DB..."; sleep 2; done
+              # loop until privileges look good
+              for i in $(seq 1 90); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1 &&
+                   psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q t &&
+                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')" | grep -q t &&
+                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')" | grep -q t
+                then
+                  echo "✅ DB & privileges ready"; exit 0
+                fi
+                echo "🔁 DB not ready yet; retrying..."; sleep 2
+              done
+              echo "❌ timed out waiting for DB privileges"; exit 1
+          volumeMounts:
+            - name: driver-config
+              mountPath: /etc/mcp
+            # Read Vault-injected files (init injector runs before our init)
+            # The path is virtual; we don't need to mount a volume since injector writes to /vault/secrets.
       containers:
         - name: bridge
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
@@ -593,6 +646,8 @@ metadata:
   name: mcp-openapi-ro
   namespace: k8s-mcp-service
   labels: { app: mcp-openapi-ro }
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   type: ClusterIP
   selector: { app: mcp-openapi-ro }
@@ -602,7 +657,7 @@ spec:
       targetPort: http
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar) — ADMIN INSTANCE (uses full RW DB via app role)
+# === OpenAPI bridge (stdio sidecar) — ADMIN INSTANCE — wave 1
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -610,6 +665,8 @@ metadata:
   name: mcp-openapi-admin
   namespace: k8s-mcp-service
   labels: { app: mcp-openapi-admin }
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   replicas: 1
   selector:
@@ -713,6 +770,44 @@ spec:
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
+        # NEW: block until DB & privileges are ready
+        - name: db-ready-check
+          image: alpine:3.20
+          env:
+            - name: DB_HOST
+              value: "yb-tserver-service.yugabyte.svc.cluster.local"
+            - name: DB_PORT
+              value: "5433"
+            - name: DB_NAME
+              value: "mcp"
+            - name: DB_SCHEMA
+              value: "mcp_openapi_admin"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              apk add --no-cache postgresql15-client netcat-openbsd >/dev/null
+              until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
+                echo "⏳ waiting for Vault creds..."; sleep 2
+              done
+              export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
+              export PGUSER="$(cat /vault/secrets/yb-username)"
+              export PGPASSWORD="$(cat /vault/secrets/yb-password)"
+              until nc -z -w1 "${PGHOST}" "${PGPORT}"; do echo "⏳ waiting for DB..."; sleep 2; done
+              for i in $(seq 1 90); do
+                if psql -tAc "SELECT 1" >/dev/null 2>&1 &&
+                   psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q t &&
+                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')" | grep -q t &&
+                   psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')" | grep -q t
+                then
+                  echo "✅ DB & privileges ready"; exit 0
+                fi
+                echo "🔁 DB not ready yet; retrying..."; sleep 2
+              done
+              echo "❌ timed out waiting for DB privileges"; exit 1
+          volumeMounts:
+            - name: driver-config
+              mountPath: /etc/mcp
       containers:
         - name: bridge
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
@@ -810,6 +905,8 @@ metadata:
   name: mcp-openapi-admin
   namespace: k8s-mcp-service
   labels: { app: mcp-openapi-admin }
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   type: ClusterIP
   selector: { app: mcp-openapi-admin }
@@ -819,13 +916,15 @@ spec:
       targetPort: http
 ---
 # ======================
-# NetworkPolicy — OpenWebUI (ingress)
+# NetworkPolicy — OpenWebUI (ingress) — wave 1
 # ======================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: mcp-openapi-allow-openwebui
   namespace: k8s-mcp-service
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   podSelector:
     matchExpressions:
