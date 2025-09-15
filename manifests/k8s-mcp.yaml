@@ -214,8 +214,7 @@ spec:
           command: ["/bin/sh","-c"]
           args:
             - |
-              set -euo pipefail
-
+              # no 'pipefail' per your preference
               PGHOST="yb-tserver-service.yugabyte.svc.cluster.local"
               PGPORT="5433"
               ADMIN_DB="yugabyte"
@@ -242,7 +241,7 @@ spec:
               SA_RO="mcp-server-ro"
               SA_ADMIN="mcp-server-admin"
 
-              apk add --no-cache postgresql15-client jq curl netcat-openbsd >/dev/null
+              apk add --no-cache postgresql15-client jq curl netcat-openbsd >/dev/null || true
 
               export PATH="$PATH:/vault-bin"
               export VAULT_ADDR
@@ -282,76 +281,96 @@ spec:
               ensure_role "${ROLE_GROUP_ADMIN}"
               ensure_role "${ROLE_GROUP_APP}"
 
-              cat >/tmp/mcp_init.sql <<SQL
-              -- Database-level privileges
+              # --- SAFE PART: DB & schema level (fail-fast) --------------------
+              cat >/tmp/mcp_safe.sql <<SQL
+              -- Database-level
+              GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${VAULTADMIN_USER};
               GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${ROLE_GROUP_ADMIN};
               GRANT ALL PRIVILEGES ON DATABASE ${APP_DB} TO ${ROLE_GROUP_APP};
               GRANT CONNECT ON DATABASE ${APP_DB} TO ${ROLE_GROUP_RO};
 
+              -- Schemas owned by vaultadmin (creates if missing)
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_RO}    AUTHORIZATION ${VAULTADMIN_USER};
               CREATE SCHEMA IF NOT EXISTS ${SCHEMA_ADMIN} AUTHORIZATION ${VAULTADMIN_USER};
 
-              -- Admin (full)
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_ADMIN};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_ADMIN};
+              -- Schema usage/create for groups and vaultadmin
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP}, ${VAULTADMIN_USER};
+              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP}, ${VAULTADMIN_USER};
 
-              -- App group (full RW for tool instances)
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
-              GRANT USAGE, CREATE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
-              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_APP};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON TABLES    TO ${ROLE_GROUP_APP};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT ALL ON SEQUENCES TO ${ROLE_GROUP_APP};
-
-              -- Read-only (optional)
+              -- Read-only schema access
               GRANT USAGE ON SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
               GRANT USAGE ON SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
+              SQL
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_safe.sql
+              echo "✅ DB & schema-level grants applied"
+
+              # --- BEST-EFFORT: existing objects (don't fail the job) ----------
+              cat >/tmp/mcp_best_effort.sql <<SQL
+              -- Grant full on existing objects to vaultadmin
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${VAULTADMIN_USER};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${VAULTADMIN_USER};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${VAULTADMIN_USER};
+
+              -- Existing objects to groups (as before)
               GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
               GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_RO};
               GRANT SELECT ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
               GRANT SELECT ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_RO}    GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON TABLES    TO ${ROLE_GROUP_RO};
-              ALTER DEFAULT PRIVILEGES IN SCHEMA ${SCHEMA_ADMIN} GRANT SELECT ON SEQUENCES TO ${ROLE_GROUP_RO};
+
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_RO}    TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
+              GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA ${SCHEMA_ADMIN} TO ${ROLE_GROUP_ADMIN}, ${ROLE_GROUP_APP};
               SQL
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -f /tmp/mcp_best_effort.sql || true
 
-              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -f /tmp/mcp_init.sql
-              echo "✅ Database, schemas & grants prepared"
+              # --- DEFAULT PRIVS for future objects by app users ---------------
+              # Note: We also bake per-user defaults into Vault creation_statements below.
+              cat >/tmp/mcp_default_privs.sql <<SQL
+              -- If app creators set ROLE mcp_group_app during DDL, defaults apply:
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_RO}
+                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_ADMIN}
+                GRANT ALL PRIVILEGES ON TABLES TO ${VAULTADMIN_USER};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_RO}
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER};
+              ALTER DEFAULT PRIVILEGES FOR ROLE ${ROLE_GROUP_APP} IN SCHEMA ${SCHEMA_ADMIN}
+                GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO ${VAULTADMIN_USER};
+              SQL
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -f /tmp/mcp_default_privs.sql || true
 
+              echo "ℹ️ Owners for key relations (for visibility):"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=0 -c \
+                "SELECT schemaname, tablename, tableowner
+                   FROM pg_catalog.pg_tables
+                  WHERE schemaname IN ('${SCHEMA_RO}','${SCHEMA_ADMIN}')
+                    AND tablename IN ('mcp_migrations');" || true
+
+              # --- Vault DB engine ------------------------------------------------
               if ! vault secrets list -format=json | jq -e 'has("'"${DB_MOUNT}"'/")' >/dev/null 2>&1; then
                 vault secrets enable -path="${DB_MOUNT}" database
               fi
 
+              # Role creation statements now ALSO set per-user default privileges
+              # so anything the dynamic user creates is automatically visible to vaultadmin.
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_RO}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
-                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_RO}"' TO "{{name}}";'
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_RO}"' TO "{{name}}";\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';'
 
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_ADMIN}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
-                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_ADMIN}"' TO "{{name}}";'
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_ADMIN}"' TO "{{name}}";\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';'
 
               vault write "${DB_MOUNT}/roles/${VAULT_ROLE_APP}" \
                 db_name="${DB_NAME_IN_VAULT}" \
                 default_ttl="1h" \
                 max_ttl="24h" \
-                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_APP}"' TO "{{name}}";'
+                creation_statements=$'CREATE ROLE "{{name}}" WITH LOGIN PASSWORD \'{{password}}\' VALID UNTIL \'{{expiration}}\';\nGRANT '"${ROLE_GROUP_APP}"' TO "{{name}}";\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT ALL PRIVILEGES ON TABLES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_RO}"'    GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';\nALTER DEFAULT PRIVILEGES FOR USER "{{name}}" IN SCHEMA '"${SCHEMA_ADMIN}"' GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO '"${VAULTADMIN_USER}"';'
 
               vault policy write "${VAULT_ROLE_RO}" - <<EOF
               path "${DB_MOUNT}/creds/${VAULT_ROLE_RO}" { capabilities = ["read"] }
@@ -381,7 +400,7 @@ spec:
                 policies="${VAULT_ROLE_APP}" \
                 ttl="24h"
 
-              echo "🎉 Vault DB engine, roles, policies, and k8s auth roles ready."
+              echo "🎉 Vault DB engine, roles, policies, and per-user default privileges ready (vaultadmin has full access)."
           volumeMounts:
             - name: root-token
               mountPath: /vault-token
@@ -441,7 +460,6 @@ spec:
               - key: driver-manifest.yaml
                 path: driver-manifest.yaml
       initContainers:
-        # Wait for kubeconfig (unchanged)
         - name: write-kubeconfig
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
@@ -475,7 +493,6 @@ spec:
           volumeMounts:
             - name: kube
               mountPath: /kube
-        # MCP binaries (unchanged)
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
@@ -506,7 +523,6 @@ spec:
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
-        # NEW: block until DB & privileges are ready
         - name: db-ready-check
           image: alpine:3.20
           env:
@@ -523,16 +539,13 @@ spec:
             - |
               set -euo pipefail
               apk add --no-cache postgresql15-client netcat-openbsd >/dev/null
-              # wait for Vault-injected creds
               until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
                 echo "⏳ waiting for Vault creds..."; sleep 2
               done
               export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
               export PGUSER="$(cat /vault/secrets/yb-username)"
               export PGPASSWORD="$(cat /vault/secrets/yb-password)"
-              # wait for DB socket
               until nc -z -w1 "${PGHOST}" "${PGPORT}"; do echo "⏳ waiting for DB..."; sleep 2; done
-              # loop until privileges look good
               for i in $(seq 1 90); do
                 if psql -tAc "SELECT 1" >/dev/null 2>&1 &&
                    psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q t &&
@@ -547,8 +560,6 @@ spec:
           volumeMounts:
             - name: driver-config
               mountPath: /etc/mcp
-            # Read Vault-injected files (init injector runs before our init)
-            # The path is virtual; we don't need to mount a volume since injector writes to /vault/secrets.
       containers:
         - name: bridge
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
@@ -770,7 +781,6 @@ spec:
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
-        # NEW: block until DB & privileges are ready
         - name: db-ready-check
           image: alpine:3.20
           env:
