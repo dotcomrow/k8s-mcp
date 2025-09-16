@@ -137,8 +137,7 @@ data:
             mode: stdio
             cmd: ["/mcpbin/mcp-kubernetes",
                   "--transport","stdio",
-                  "--access-level","readonly",        # "admin" in the admin CM
-                  "--kubeconfig","/kube/config"]
+                  "--access-level","readonly"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
@@ -237,8 +236,7 @@ data:
             mode: stdio
             cmd: ["/mcpbin/mcp-kubernetes",
                   "--transport","stdio",
-                  "--access-level","admin",        # "admin" in the admin CM
-                  "--kubeconfig","/kube/config"]
+                  "--access-level","admin"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
