@@ -135,7 +135,8 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes", "--access-level", "readonly"]
+            # IMPORTANT: add "serve" and access level
+            cmd: ["/mcpbin/mcp-kubernetes","serve","--transport","stdio","--access-level","readonly"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
@@ -170,7 +171,7 @@ data:
               database:
                 mount: yugabyte-db
                 role: mcp-yb-ro
-                mode: static           # use static-creds/<role> (matches your init Job)
+                mode: static          # <— static creds path
                 renewBefore: 120
             yugabyte:
               host: yb-tserver-service.yugabyte.svc.cluster.local
@@ -232,7 +233,7 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes", "--access-level", "readonly"]
+            cmd: ["/mcpbin/mcp-kubernetes","serve","--transport","stdio","--access-level","admin"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
@@ -332,32 +333,24 @@ spec:
           args:
             - |
               set -euo pipefail
-
               PGHOST="yb-tserver-service.yugabyte.svc.cluster.local"
               PGPORT="5433"
               ADMIN_DB="yugabyte"
               APP_DB="mcp"
-
               VAULTADMIN_USER="vaultadmin"
               VAULTADMIN_KV_PATH="secret/vaultadmin"
-
-              # two static DB users with identical permissions
               USER_ADMIN="mcp_admin"
               USER_RO="mcp_ro"
-
               SCHEMA_RO="mcp_openapi_ro"
               SCHEMA_ADMIN="mcp_openapi_admin"
-
               VAULT_ADDR="http://vault.vault.svc.cluster.local:8200"
               AUTH_PATH="kubernetes"
-
               DB_MOUNT="yugabyte-db"
               DB_NAME_IN_VAULT="yugabyte"
               ROLE_STATIC_ADMIN="mcp-yb-admin"
               ROLE_STATIC_RO="mcp-yb-ro"
 
               apk add --no-cache postgresql15-client jq curl netcat-openbsd >/dev/null || true
-
               export PATH="$PATH:/vault-bin"
               export VAULT_ADDR
 
@@ -405,10 +398,8 @@ spec:
                 echo "✅ Role ${USER_RO} exists"
               fi
 
-              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
-                -c "GRANT ${USER_ADMIN} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
-              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 \
-                -c "GRANT ${USER_RO} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -c "GRANT ${USER_ADMIN} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
+              psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$APP_DB" -v ON_ERROR_STOP=1 -c "GRANT ${USER_RO} TO ${VAULTADMIN_USER} WITH ADMIN OPTION;"
 
               cat >/tmp/mcp_safe.sql <<SQL
               CREATE SCHEMA IF NOT EXISTS mcp_openapi_ro    AUTHORIZATION ${VAULTADMIN_USER};
@@ -671,28 +662,17 @@ spec:
               DB_SCHEMA="$(yq -r '.spec.migrator.db.schema' "${MAN}")"
               USER_FILE="$(yq -r '.spec.migrator.db.usernameFile' "${MAN}")"
               PASS_FILE="$(yq -r '.spec.migrator.db.passwordFile' "${MAN}")"
-
-              until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do
-                echo "⏳ waiting for Vault creds..."; sleep 2
-              done
-
+              until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do echo "⏳ waiting for Vault creds..."; sleep 2; done
               export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
               export PGUSER="$(cat "${USER_FILE}")"
               export PGPASSWORD="$(cat "${PASS_FILE}")"
-
-              for _ in $(seq 1 60); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
-                echo "⏳ waiting for DB to accept connections..."; sleep 2
-              done
-
+              for _ in $(seq 1 60); do if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi; echo "⏳ waiting for DB..."; sleep 2; done
               for _ in $(seq 1 90); do
                 if psql -tAc "SELECT 1" >/dev/null 2>&1 \
-                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
-                then
-                  echo "✅ DB & privileges ready"; exit 0
-                fi
+                 && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                 && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                 && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
+                then echo "✅ DB & privileges ready"; exit 0; fi
                 echo "🔁 DB not ready yet; retrying..."; sleep 2
               done
               echo "❌ timed out waiting for DB privileges"; exit 1
@@ -889,28 +869,17 @@ spec:
               DB_SCHEMA="$(yq -r '.spec.migrator.db.schema' "${MAN}")"
               USER_FILE="$(yq -r '.spec.migrator.db.usernameFile' "${MAN}")"
               PASS_FILE="$(yq -r '.spec.migrator.db.passwordFile' "${MAN}")"
-
-              until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do
-                echo "⏳ waiting for Vault creds..."; sleep 2
-              done
-
+              until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do echo "⏳ waiting for Vault creds..."; sleep 2; done
               export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
               export PGUSER="$(cat "${USER_FILE}")"
               export PGPASSWORD="$(cat "${PASS_FILE}")"
-
-              for _ in $(seq 1 60); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
-                echo "⏳ waiting for DB to accept connections..."; sleep 2
-              done
-
+              for _ in $(seq 1 60); do if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi; echo "⏳ waiting for DB..."; sleep 2; done
               for _ in $(seq 1 90); do
                 if psql -tAc "SELECT 1" >/dev/null 2>&1 \
-                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
-                then
-                  echo "✅ DB & privileges ready"; exit 0
-                fi
+                 && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                 && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                 && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
+                then echo "✅ DB & privileges ready"; exit 0; fi
                 echo "🔁 DB not ready yet; retrying..."; sleep 2
               done
               echo "❌ timed out waiting for DB privileges"; exit 1
