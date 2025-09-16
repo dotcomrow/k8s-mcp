@@ -135,10 +135,10 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes",
-                  "--transport","stdio",
-                  "--access-level","readonly"]
-            env: { KUBECONFIG: "/kube/config" }
+            cmd: ["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","readonly"]
+            env:
+              KUBECONFIG: "/kube/config"
+              PATH: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             cwd: "/"
 
       cors:
@@ -234,10 +234,10 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes",
-                  "--transport","stdio",
-                  "--access-level","admin"]
-            env: { KUBECONFIG: "/kube/config" }
+            cmd: ["/mcpbin/mcp-kubernetes","--transport","stdio","--access-level","admin"]
+            env:
+              KUBECONFIG: "/kube/config"
+              PATH: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             cwd: "/"
 
       cors:
