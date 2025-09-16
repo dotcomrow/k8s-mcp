@@ -119,6 +119,12 @@ data:
     spec:
       instanceId: k8s-mcp-service:mcp-openapi-ro
 
+      redis:
+        url: redis://redis.redis.svc.cluster.local:6379/0
+        namespace: driver:k8s-mcp-service:mcp-openapi-ro
+        key_prefix: driver
+        default_ttl_seconds: 600
+
       transport:
         prefer: stdio
         stdio:
@@ -217,6 +223,12 @@ data:
       name: mcp-openapi-admin
     spec:
       instanceId: k8s-mcp-service:mcp-openapi-admin
+
+      redis:
+        url: redis://redis.redis.svc.cluster.local:6379/0
+        namespace: driver:k8s-mcp-service:mcp-openapi-ro
+        key_prefix: driver
+        default_ttl_seconds: 600
 
       transport:
         prefer: stdio
@@ -684,7 +696,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-172828
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-211819
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
@@ -891,7 +903,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-172828
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-211819
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
