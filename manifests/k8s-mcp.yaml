@@ -135,8 +135,10 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            # IMPORTANT: add "serve" and access level
-            cmd: ["/mcpbin/mcp-kubernetes","serve","--transport","stdio","--access-level","readonly"]
+            cmd: ["/mcpbin/mcp-kubernetes",
+                  "--transport","stdio",
+                  "--access-level","readonly",        # "admin" in the admin CM
+                  "--kubeconfig","/kube/config"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
@@ -233,7 +235,10 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes","serve","--transport","stdio","--access-level","admin"]
+            cmd: ["/mcpbin/mcp-kubernetes",
+                  "--transport","stdio",
+                  "--access-level","admin",        # "admin" in the admin CM
+                  "--kubeconfig","/kube/config"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
