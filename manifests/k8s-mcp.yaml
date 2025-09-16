@@ -662,7 +662,7 @@ spec:
             - |
               set -euo pipefail
               apk add --no-cache yq >/dev/null
-              MAN=/config/driver-manifest.yaml
+              MAN=/etc/mcp/driver-manifest.yaml
               DB_HOST="$(yq -r '.spec.migrator.db.host' "${MAN}")"
               DB_PORT="$(yq -r '.spec.migrator.db.port' "${MAN}")"
               DB_NAME="$(yq -r '.spec.migrator.db.name' "${MAN}")"
@@ -696,11 +696,16 @@ spec:
               echo "❌ timed out waiting for DB privileges"; exit 1
           volumeMounts:
             - name: driver-config
-              mountPath: /config
+              mountPath: /etc/mcp
       containers:
         - name: bridge
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
           imagePullPolicy: Always
+          env:
+            - name: MANIFEST_PATH
+              value: /etc/mcp/driver-manifest.yaml
+            - name: DRIVER_MANIFEST_PATH
+              value: /etc/mcp/driver-manifest.yaml
           ports:
             - name: http
               containerPort: 8080
@@ -730,7 +735,7 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
             - name: driver-config
-              mountPath: /config
+              mountPath: /etc/mcp
               readOnly: true
 ---
 apiVersion: v1
@@ -875,7 +880,7 @@ spec:
             - |
               set -euo pipefail
               apk add --no-cache yq >/dev/null
-              MAN=/config/driver-manifest.yaml
+              MAN=/etc/mcp/driver-manifest.yaml
               DB_HOST="$(yq -r '.spec.migrator.db.host' "${MAN}")"
               DB_PORT="$(yq -r '.spec.migrator.db.port' "${MAN}")"
               DB_NAME="$(yq -r '.spec.migrator.db.name' "${MAN}")"
@@ -909,11 +914,16 @@ spec:
               echo "❌ timed out waiting for DB privileges"; exit 1
           volumeMounts:
             - name: driver-config
-              mountPath: /config
+              mountPath: /etc/mcp
       containers:
         - name: bridge
           image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
           imagePullPolicy: Always
+          env:
+            - name: MANIFEST_PATH
+              value: /etc/mcp/driver-manifest.yaml
+            - name: DRIVER_MANIFEST_PATH
+              value: /etc/mcp/driver-manifest.yaml
           ports:
             - name: http
               containerPort: 8080
@@ -943,7 +953,7 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
             - name: driver-config
-              mountPath: /config
+              mountPath: /etc/mcp
               readOnly: true
 ---
 apiVersion: v1
