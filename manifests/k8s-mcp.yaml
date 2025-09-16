@@ -135,7 +135,8 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes", "--transport", "stdio"]
+            # IMPORTANT: include 'serve' subcommand
+            cmd: ["/mcpbin/mcp-kubernetes", "serve", "--transport", "stdio"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
@@ -231,7 +232,8 @@ data:
         servers:
           - alias: mcp
             mode: stdio
-            cmd: ["/mcpbin/mcp-kubernetes", "--transport", "stdio"]
+            # IMPORTANT: include 'serve' subcommand
+            cmd: ["/mcpbin/mcp-kubernetes", "serve", "--transport", "stdio"]
             env: { KUBECONFIG: "/kube/config" }
             cwd: "/"
 
