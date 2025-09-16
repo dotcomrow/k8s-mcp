@@ -701,7 +701,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-015905
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
@@ -919,7 +919,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-015905
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
