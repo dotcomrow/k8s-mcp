@@ -101,7 +101,7 @@ subjects:
     namespace: k8s-mcp-service
 ---
 # ======================
-# Driver Configs (per-deployment) — wave 0
+# App/Driver Manifests (per-deployment) — wave 0
 # ======================
 apiVersion: v1
 kind: ConfigMap
@@ -115,33 +115,93 @@ data:
     apiVersion: mcp.openapi/v1alpha1
     kind: DriverManifest
     metadata:
-      name: yugabyte
+      name: mcp-openapi-ro
     spec:
+      instanceId: k8s-mcp-service:mcp-openapi-ro
+
+      # Transport + servers (matches app.py manifest loader)
+      transport:
+        prefer: stdio
+        stdio:
+          enabled: true
+          force: true
+          initTimeoutSeconds: 45
+          preflight: true
+          preflightConfig: false
+          extraArgs: []
+        rpc:
+          url: ""   # optional HTTP RPC endpoint (leave empty to skip)
+        forward:
+          url: ""   # optional fallback forward URL
+        servers:
+          - alias: mcp
+            mode: stdio
+            cmd: ["/mcpbin/mcp-kubernetes", "--transport", "stdio"]
+            env: { KUBECONFIG: "/kube/config" }
+            cwd: "/"
+
+      # CORS for the OpenAPI bridge
+      cors:
+        allow_origins: ["*"]
+        allow_methods: ["*"]
+        allow_headers: ["*"]
+
+      # Migrator configuration (used by app.py to set DB_* for migrator.py)
+      migrator:
+        run: true
+        db:
+          host: yb-tserver-service.yugabyte.svc.cluster.local
+          port: 5433
+          name: mcp
+          schema: mcp_openapi_ro
+          sslmode: disable
+          usernameFile: /vault/secrets/yb-username
+          passwordFile: /vault/secrets/yb-password
+          migrationsDir: /app/migrations
+          seedsDir: /app/seeds
+
+      # Data-plane drivers
       drivers:
         - name: yugabyte
+          module: mcp_openapi.drivers.yugabyte_driver
           config:
-            redis:
-              url: redis://redis.redis.svc.cluster.local:6379/0
-              namespace: k8s-mcp-service:mcp-openapi-ro
-              key_prefix: mcp
-              ttl_seconds: 60
+            vault:
+              address: http://vault.vault.svc.cluster.local:8200
+              auth:
+                method: kubernetes
+                mount: kubernetes
+                role: mcp-yb-ro
+              database:
+                mount: yugabyte-db
+                role: mcp-yb-ro
+                renewBefore: 120
             yugabyte:
               host: yb-tserver-service.yugabyte.svc.cluster.local
               port: 5433
-              database: mcp
-              schema: mcp_openapi_ro
+              dbname: mcp
               sslmode: disable
-              usernameFile: /vault/secrets/yb-username
-              passwordFile: /vault/secrets/yb-password
-              pool:
-                min_size: 1
-                max_size: 8
-            bootstrap:
-              create_schema: true
-              run_migrations: true
+            init:
+              schema: mcp_openapi_ro
+              createIfMissing: true
+              ddl: []
+            pool:
+              min: 1
+              max: 8
+              statementTimeoutMs: 60000
+            cache:
+              ttlSeconds: 600
             sync:
-              enabled: true
-              interval_seconds: 15
+              jobs:
+                - name: tables
+                  query: |
+                    select table_schema||'.'||table_name as fqn
+                    from information_schema.tables
+                    where table_schema in ('public','mcp_openapi_ro')
+                    order by 1
+                  key: tables
+                  mode: list
+                  intervalSeconds: 60
+                  ttlSeconds: 600
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -155,36 +215,93 @@ data:
     apiVersion: mcp.openapi/v1alpha1
     kind: DriverManifest
     metadata:
-      name: yugabyte
+      name: mcp-openapi-admin
     spec:
+      instanceId: k8s-mcp-service:mcp-openapi-admin
+
+      transport:
+        prefer: stdio
+        stdio:
+          enabled: true
+          force: true
+          initTimeoutSeconds: 45
+          preflight: true
+          preflightConfig: false
+          extraArgs: []
+        rpc:
+          url: ""
+        forward:
+          url: ""
+        servers:
+          - alias: mcp
+            mode: stdio
+            cmd: ["/mcpbin/mcp-kubernetes", "--transport", "stdio"]
+            env: { KUBECONFIG: "/kube/config" }
+            cwd: "/"
+
+      cors:
+        allow_origins: ["*"]
+        allow_methods: ["*"]
+        allow_headers: ["*"]
+
+      migrator:
+        run: true
+        db:
+          host: yb-tserver-service.yugabyte.svc.cluster.local
+          port: 5433
+          name: mcp
+          schema: mcp_openapi_admin
+          sslmode: disable
+          usernameFile: /vault/secrets/yb-username
+          passwordFile: /vault/secrets/yb-password
+          migrationsDir: /app/migrations
+          seedsDir: /app/seeds
+
       drivers:
         - name: yugabyte
+          module: mcp_openapi.drivers.yugabyte_driver
           config:
-            redis:
-              url: redis://redis.redis.svc.cluster.local:6379/0
-              namespace: k8s-mcp-service:mcp-openapi-admin
-              key_prefix: mcp
-              ttl_seconds: 60
+            vault:
+              address: http://vault.vault.svc.cluster.local:8200
+              auth:
+                method: kubernetes
+                mount: kubernetes
+                role: mcp-yb-admin
+              database:
+                mount: yugabyte-db
+                role: mcp-yb-admin
+                renewBefore: 120
             yugabyte:
               host: yb-tserver-service.yugabyte.svc.cluster.local
               port: 5433
-              database: mcp
-              schema: mcp_openapi_admin
+              dbname: mcp
               sslmode: disable
-              usernameFile: /vault/secrets/yb-username
-              passwordFile: /vault/secrets/yb-password
-              pool:
-                min_size: 1
-                max_size: 8
-            bootstrap:
-              create_schema: true
-              run_migrations: true
+            init:
+              schema: mcp_openapi_admin
+              createIfMissing: true
+              ddl: []
+            pool:
+              min: 1
+              max: 8
+              statementTimeoutMs: 60000
+            cache:
+              ttlSeconds: 600
             sync:
-              enabled: true
-              interval_seconds: 10
+              jobs:
+                - name: tables
+                  query: |
+                    select table_schema||'.'||table_name as fqn
+                    from information_schema.tables
+                    where table_schema in ('public','mcp_openapi_admin')
+                    order by 1
+                  key: tables
+                  mode: list
+                  intervalSeconds: 60
+                  ttlSeconds: 600
 ---
 # =================================================================
 # Init: Vault + Yugabyte setup (two static users; equal perms) — wave 0
+# (restored full original script)
 # =================================================================
 apiVersion: batch/v1
 kind: Job
@@ -435,7 +552,7 @@ spec:
             limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar) — READ-ONLY INSTANCE — wave 1
+# === OpenAPI bridge — READ-ONLY INSTANCE — wave 1
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -490,62 +607,59 @@ spec:
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
-              done
-              echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          args: |
+            set -eu
+            for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
+              if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
+            done
+            echo "mcp-kubernetes binary not found in image" >&2; exit 1
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
         - name: install-kubectl
           image: bitnami/kubectl:1.29
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              SRC="/opt/bitnami/kubectl/bin/kubectl"
-              if [ -x "$SRC" ]; then
-                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              elif command -v kubectl >/dev/null 2>&1; then
-                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              else
-                echo "kubectl not found in bitnami image" >&2; exit 1
-              fi
+          args: |
+            set -eu
+            SRC="/opt/bitnami/kubectl/bin/kubectl"
+            if [ -x "$SRC" ]; then
+              cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            elif command -v kubectl >/dev/null 2>&1; then
+              cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            else
+              echo "kubectl not found in bitnami image" >&2; exit 1
+            fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
@@ -553,109 +667,51 @@ spec:
           image: postgres:15-alpine
           securityContext:
             runAsNonRoot: false
-            runAsUser: 0           # init only; avoids any UID issues in the base image
+            runAsUser: 0
             allowPrivilegeEscalation: false
-          env:
-            - name: DB_HOST
-              value: "yb-tserver-service.yugabyte.svc.cluster.local"
-            - name: DB_PORT
-              value: "5433"
-            - name: DB_NAME
-              value: "mcp"
-            - name: DB_SCHEMA
-              value: "mcp_openapi_ro"
           command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -euo pipefail
-              # wait for Vault-injected creds from the agent
-              until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
-                echo "⏳ waiting for Vault creds..."; sleep 2
-              done
-              export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
-              export PGUSER="$(cat /vault/secrets/yb-username)"
-              export PGPASSWORD="$(cat /vault/secrets/yb-password)"
+          args: |
+            set -euo pipefail
+            apk add --no-cache yq >/dev/null
+            MAN=/config/driver-manifest.yaml
+            DB_HOST="$(yq -r '.spec.migrator.db.host' "${MAN}")"
+            DB_PORT="$(yq -r '.spec.migrator.db.port' "${MAN}")"
+            DB_NAME="$(yq -r '.spec.migrator.db.name' "${MAN}")"
+            DB_SCHEMA="$(yq -r '.spec.migrator.db.schema' "${MAN}")"
+            USER_FILE="$(yq -r '.spec.migrator.db.usernameFile' "${MAN}")"
+            PASS_FILE="$(yq -r '.spec.migrator.db.passwordFile' "${MAN}")"
 
-              # wait until DB accepts connections, using psql directly (no nc)
-              for _ in $(seq 1 60); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
-                echo "⏳ waiting for DB to accept connections..."; sleep 2
-              done
+            until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do
+              echo "⏳ waiting for Vault creds..."; sleep 2
+            done
 
-              # verify the effective privileges we require
-              for _ in $(seq 1 90); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1 \
-                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
-                then
-                  echo "✅ DB & privileges ready"; exit 0
-                fi
-                echo "🔁 DB not ready yet; retrying..."; sleep 2
-              done
-              echo "❌ timed out waiting for DB privileges"; exit 1
+            export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
+            export PGUSER="$(cat "${USER_FILE}")"
+            export PGPASSWORD="$(cat "${PASS_FILE}")"
+
+            for _ in $(seq 1 60); do
+              if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
+              echo "⏳ waiting for DB to accept connections..."; sleep 2
+            done
+
+            for _ in $(seq 1 90); do
+              if psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
+              then
+                echo "✅ DB & privileges ready"; exit 0
+              fi
+              echo "🔁 DB not ready yet; retrying..."; sleep 2
+            done
+            echo "❌ timed out waiting for DB privileges"; exit 1
           volumeMounts:
             - name: driver-config
-              mountPath: /etc/mcp
+              mountPath: /config
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
           imagePullPolicy: Always
-          env:
-            - name: PATH
-              value: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            - name: MCP_STDIO_ENABLED
-              value: "1"
-            - name: MCP_FORCE_STDIO
-              value: "1"
-            - name: MCP_STDIO_INIT_TIMEOUT
-              value: "45"
-            - name: MCP_STDIO_PREFLIGHT
-              value: "1"
-            - name: MCP_STDIO_EXTRA_ARGS
-              value: ""
-            - name: MCP_SERVERS
-              value: |
-                [
-                  {
-                    "alias": "mcp",
-                    "mode": "stdio",
-                    "cmd": ["/mcpbin/mcp-kubernetes", "--transport", "stdio"],
-                    "env": { "KUBECONFIG": "/kube/config" }
-                  }
-                ]
-            - name: MCP_DRIVER_MODULES
-              value: "mcp_openapi.drivers.yugabyte_driver"
-            - name: DRIVER_MANIFEST_PATH
-              value: "/etc/mcp/driver-manifest.yaml"
-            - name: DRIVER_CACHE_TTL_SECONDS
-              value: "60"
-            - name: DRIVER_CACHE_MAX_WAIT_SECONDS
-              value: "10"
-            - name: CORS_ALLOW_ORIGINS
-              value: "*"
-            - name: STARTUP_TIMEOUT
-              value: "30"
-            - name: RUN_MIGRATIONS
-              value: "1"
-            - name: DB_HOST
-              value: "yb-tserver-service.yugabyte.svc.cluster.local"
-            - name: DB_PORT
-              value: "5433"
-            - name: DB_NAME
-              value: "mcp"
-            - name: DB_SCHEMA
-              value: "mcp_openapi_ro"
-            - name: DB_SSLMODE
-              value: "disable"
-            - name: DB_USER_FILE
-              value: "/vault/secrets/yb-username"
-            - name: DB_PASS_FILE
-              value: "/vault/secrets/yb-password"
-            - name: DB_MIGRATIONS_DIR
-              value: "/app/migrations"
-            - name: DB_SEEDS_DIR
-              value: "/app/seeds"
           ports:
             - name: http
               containerPort: 8080
@@ -685,7 +741,7 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
             - name: driver-config
-              mountPath: /etc/mcp
+              mountPath: /config
               readOnly: true
 ---
 apiVersion: v1
@@ -705,7 +761,7 @@ spec:
       targetPort: http
 ---
 # =================================================================
-# === OpenAPI bridge (stdio sidecar) — ADMIN INSTANCE — wave 1
+# === OpenAPI bridge — ADMIN INSTANCE — wave 1
 # =================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -760,62 +816,59 @@ spec:
           image: alpine:3.20
           securityContext: { runAsUser: 0, runAsNonRoot: false }
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
-              cat > /kube/config <<EOF
-              apiVersion: v1
-              kind: Config
-              clusters:
-              - cluster:
-                  certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-                  server: ${API}
-                name: in
-              contexts:
-              - context:
-                  cluster: in
-                  namespace: ${NS}
-                  user: sa
-                name: in
-              current-context: in
-              users:
-              - name: sa
-                user:
-                  token: ${TOKEN}
-              EOF
+          args: |
+            set -eu
+            API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+            TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+            NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+            cat > /kube/config <<EOF
+            apiVersion: v1
+            kind: Config
+            clusters:
+            - cluster:
+                certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                server: ${API}
+              name: in
+            contexts:
+            - context:
+                cluster: in
+                namespace: ${NS}
+                user: sa
+              name: in
+            current-context: in
+            users:
+            - name: sa
+              user:
+                token: ${TOKEN}
+            EOF
           volumeMounts:
             - name: kube
               mountPath: /kube
         - name: fetch-mcp-binary
           image: ghcr.io/azure/mcp-kubernetes:latest
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
-                if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
-              done
-              echo "mcp-kubernetes binary not found in image" >&2; exit 1
+          args: |
+            set -eu
+            for p in /usr/local/bin/mcp-kubernetes /app/mcp-kubernetes /mcp-kubernetes; do
+              if [ -x "$p" ]; then cp "$p" /mcpbin/mcp-kubernetes && chmod +x /mcpbin/mcp-kubernetes && exit 0; fi
+            done
+            echo "mcp-kubernetes binary not found in image" >&2; exit 1
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
         - name: install-kubectl
           image: bitnami/kubectl:1.29
           command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -eu
-              SRC="/opt/bitnami/kubectl/bin/kubectl"
-              if [ -x "$SRC" ]; then
-                cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              elif command -v kubectl >/dev/null 2>&1; then
-                cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
-              else
-                echo "kubectl not found in bitnami image" >&2; exit 1
-              fi
+          args: |
+            set -eu
+            SRC="/opt/bitnami/kubectl/bin/kubectl"
+            if [ -x "$SRC" ]; then
+              cp "$SRC" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            elif command -v kubectl >/dev/null 2>&1; then
+              cp "$(command -v kubectl)" /mcpbin/kubectl && chmod +x /mcpbin/kubectl
+            else
+              echo "kubectl not found in bitnami image" >&2; exit 1
+            fi
           volumeMounts:
             - name: mcpbin
               mountPath: /mcpbin
@@ -825,104 +878,49 @@ spec:
             runAsNonRoot: false
             runAsUser: 0
             allowPrivilegeEscalation: false
-          env:
-            - name: DB_HOST
-              value: "yb-tserver-service.yugabyte.svc.cluster.local"
-            - name: DB_PORT
-              value: "5433"
-            - name: DB_NAME
-              value: "mcp"
-            - name: DB_SCHEMA
-              value: "mcp_openapi_admin"
           command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -euo pipefail
-              until [ -s /vault/secrets/yb-username ] && [ -s /vault/secrets/yb-password ]; do
-                echo "⏳ waiting for Vault creds..."; sleep 2
-              done
-              export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
-              export PGUSER="$(cat /vault/secrets/yb-username)"
-              export PGPASSWORD="$(cat /vault/secrets/yb-password)"
+          args: |
+            set -euo pipefail
+            apk add --no-cache yq >/dev/null
+            MAN=/config/driver-manifest.yaml
+            DB_HOST="$(yq -r '.spec.migrator.db.host' "${MAN}")"
+            DB_PORT="$(yq -r '.spec.migrator.db.port' "${MAN}")"
+            DB_NAME="$(yq -r '.spec.migrator.db.name' "${MAN}")"
+            DB_SCHEMA="$(yq -r '.spec.migrator.db.schema' "${MAN}")"
+            USER_FILE="$(yq -r '.spec.migrator.db.usernameFile' "${MAN}")"
+            PASS_FILE="$(yq -r '.spec.migrator.db.passwordFile' "${MAN}")"
 
-              for _ in $(seq 1 60); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
-                echo "⏳ waiting for DB to accept connections..."; sleep 2
-              done
+            until [ -s "${USER_FILE}" ] && [ -s "${PASS_FILE}" ]; do
+              echo "⏳ waiting for Vault creds..."; sleep 2
+            done
 
-              for _ in $(seq 1 90); do
-                if psql -tAc "SELECT 1" >/dev/null 2>&1 \
-                  && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
-                  && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
-                then
-                  echo "✅ DB & privileges ready"; exit 0
-                fi
-                echo "🔁 DB not ready yet; retrying..."; sleep 2
-              done
-              echo "❌ timed out waiting for DB privileges"; exit 1
+            export PGHOST="${DB_HOST}" PGPORT="${DB_PORT}" PGDATABASE="${DB_NAME}"
+            export PGUSER="$(cat "${USER_FILE}")"
+            export PGPASSWORD="$(cat "${PASS_FILE}")"
+
+            for _ in $(seq 1 60); do
+              if psql -tAc "SELECT 1" >/dev/null 2>&1; then break; fi
+              echo "⏳ waiting for DB to accept connections..."; sleep 2
+            done
+
+            for _ in $(seq 1 90); do
+              if psql -tAc "SELECT 1" >/dev/null 2>&1 \
+                && psql -tAc "SELECT has_database_privilege(current_user, '${DB_NAME}', 'CREATE')" | grep -q 't' \
+                && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'USAGE')"   | grep -q 't' \
+                && psql -tAc "SELECT has_schema_privilege(current_user, '${DB_SCHEMA}', 'CREATE')"  | grep -q 't'
+              then
+                echo "✅ DB & privileges ready"; exit 0
+              fi
+              echo "🔁 DB not ready yet; retrying..."; sleep 2
+            done
+            echo "❌ timed out waiting for DB privileges"; exit 1
           volumeMounts:
             - name: driver-config
-              mountPath: /etc/mcp
+              mountPath: /config
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250915-144748
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-010608
           imagePullPolicy: Always
-          env:
-            - name: PATH
-              value: "/mcpbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-            - name: MCP_STDIO_ENABLED
-              value: "1"
-            - name: MCP_FORCE_STDIO
-              value: "1"
-            - name: MCP_STDIO_INIT_TIMEOUT
-              value: "45"
-            - name: MCP_STDIO_PREFLIGHT
-              value: "1"
-            - name: MCP_STDIO_EXTRA_ARGS
-              value: ""
-            - name: MCP_SERVERS
-              value: |
-                [
-                  {
-                    "alias": "mcp",
-                    "mode": "stdio",
-                    "cmd": ["/mcpbin/mcp-kubernetes", "--transport", "stdio"],
-                    "env": { "KUBECONFIG": "/kube/config" }
-                  }
-                ]
-            - name: MCP_DRIVER_MODULES
-              value: "mcp_openapi.drivers.yugabyte_driver"
-            - name: DRIVER_MANIFEST_PATH
-              value: "/etc/mcp/driver-manifest.yaml"
-            - name: DRIVER_CACHE_TTL_SECONDS
-              value: "60"
-            - name: DRIVER_CACHE_MAX_WAIT_SECONDS
-              value: "10"
-            - name: CORS_ALLOW_ORIGINS
-              value: "*"
-            - name: STARTUP_TIMEOUT
-              value: "30"
-            - name: RUN_MIGRATIONS
-              value: "1"
-            - name: DB_HOST
-              value: "yb-tserver-service.yugabyte.svc.cluster.local"
-            - name: DB_PORT
-              value: "5433"
-            - name: DB_NAME
-              value: "mcp"
-            - name: DB_SCHEMA
-              value: "mcp_openapi_admin"
-            - name: DB_SSLMODE
-              value: "disable"
-            - name: DB_USER_FILE
-              value: "/vault/secrets/yb-username"
-            - name: DB_PASS_FILE
-              value: "/vault/secrets/yb-password"
-            - name: DB_MIGRATIONS_DIR
-              value: "/app/migrations"
-            - name: DB_SEEDS_DIR
-              value: "/app/seeds"
           ports:
             - name: http
               containerPort: 8080
@@ -952,7 +950,7 @@ spec:
             - name: mcpbin
               mountPath: /mcpbin
             - name: driver-config
-              mountPath: /etc/mcp
+              mountPath: /config
               readOnly: true
 ---
 apiVersion: v1
