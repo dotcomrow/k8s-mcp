@@ -120,7 +120,7 @@ data:
       instanceId: k8s-mcp-service:mcp-openapi-ro
 
       redis:
-        url: redis://<path:kv/data/redis#password>@redis-0.redis-headless.redis.svc.cluster.local:6379/0
+        url: redis://<path:secret/data/redis#password>@redis-0.redis-headless.redis.svc.cluster.local:6379/0
         namespace: driver:k8s-mcp-service:mcp-openapi-ro
         key_prefix: driver
         default_ttl_seconds: 600
