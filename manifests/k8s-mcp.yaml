@@ -124,6 +124,9 @@ data:
         namespace: driver:k8s-mcp-service:mcp-openapi-ro
         key_prefix: driver
         default_ttl_seconds: 600
+      openapiCache:
+        namespace: mcp-openapi-ro     # namespace for the cached OpenAPI document in Redis
+        ttlSeconds: 600   
 
       transport:
         prefer: stdio
@@ -229,6 +232,9 @@ data:
         namespace: driver:k8s-mcp-service:mcp-openapi-ro
         key_prefix: driver
         default_ttl_seconds: 600
+      openapiCache:
+        namespace: mcp-openapi-ro     # namespace for the cached OpenAPI document in Redis
+        ttlSeconds: 600   
 
       transport:
         prefer: stdio
@@ -696,7 +702,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-211819
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250919-215329
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
@@ -903,7 +909,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250916-211819
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250919-215329
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
