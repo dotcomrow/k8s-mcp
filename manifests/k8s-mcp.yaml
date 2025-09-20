@@ -134,7 +134,7 @@ data:
           enabled: true
           force: true
           initTimeoutSeconds: 45
-          preflight: true
+          preflight: false
           preflightConfig: false
           extraArgs: []
         rpc:
@@ -230,7 +230,7 @@ data:
           enabled: true
           force: true
           initTimeoutSeconds: 45
-          preflight: true
+          preflight: false
           preflightConfig: false
           extraArgs: []
         rpc:
@@ -678,7 +678,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250920-000528
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250920-002026
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
@@ -885,7 +885,7 @@ spec:
               mountPath: /etc/mcp
       containers:
         - name: bridge
-          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250920-000528
+          image: ghcr.io/dotcomrow/mcp-openapi-tool-server-image:ts-20250920-002026
           imagePullPolicy: Always
           env:
             - name: MANIFEST_PATH
