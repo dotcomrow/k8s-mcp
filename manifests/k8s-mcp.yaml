@@ -363,6 +363,17 @@ spec:
 
               export PGPASSWORD="$VAULTADMIN_PASS"
 
+              # Wait until the bootstrap role is created elsewhere (pre-req for this job)
+              while true; do
+                ROLE_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -Atc "SELECT 1 FROM pg_roles WHERE rolname='${VAULTADMIN_USER}'" 2>/dev/null || true)"
+                if [ "${ROLE_EXISTS}" = "1" ]; then
+                  echo "✅ Role ${VAULTADMIN_USER} exists; continuing"
+                  break
+                fi
+                echo "⏳ Waiting for role ${VAULTADMIN_USER} to exist before continuing..."
+                sleep 5
+              done
+
               DB_EXISTS="$(psql -h "$PGHOST" -p "$PGPORT" -U "$VAULTADMIN_USER" -d "$ADMIN_DB" -Atc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'" || true)"
               if [ "${DB_EXISTS}" != "1" ]; then
                 echo "📦 Creating DB '${APP_DB}' owned by ${VAULTADMIN_USER}…"
