@@ -354,8 +354,17 @@ spec:
               until [ -s /vault-token/VAULT_TOKEN ]; do echo "🔁 waiting for /vault-token/VAULT_TOKEN..."; sleep 2; done
               export VAULT_TOKEN="$(cat /vault-token/VAULT_TOKEN)"
 
-              echo "🔐 Fetching ${VAULTADMIN_KV_PATH}..."
-              VAULTADMIN_PASS="$(vault kv get -format=json "${VAULTADMIN_KV_PATH}" | jq -r '.data.data.password // .data.data.value')"
+              while true; do
+                echo "🔐 Fetching ${VAULTADMIN_KV_PATH}..."
+                if VAULTADMIN_JSON="$(vault kv get -format=json "${VAULTADMIN_KV_PATH}" 2>/dev/null)"; then
+                  VAULTADMIN_PASS="$(printf '%s' "${VAULTADMIN_JSON}" | jq -r '.data.data.password // .data.data.value // empty')"
+                  if [ -n "${VAULTADMIN_PASS}" ]; then
+                    break
+                  fi
+                fi
+                echo "⏳ ${VAULTADMIN_KV_PATH} not ready; retrying in 5s"
+                sleep 5
+              done
 
               until getent hosts "$PGHOST" >/dev/null 2>&1; do echo "🔄 waiting for DNS $PGHOST..."; sleep 3; done
               until nc -z -w1 "$PGHOST" "$PGPORT"; do echo "⏳ waiting for DB $PGHOST:$PGPORT..."; sleep 3; done
