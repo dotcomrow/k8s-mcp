@@ -589,9 +589,6 @@ spec:
             - name: root-token
               mountPath: /vault-token
               readOnly: true
-          resources:
-            requests: { cpu: "50m",  memory: "64Mi" }
-            limits:   { cpu: "200m", memory: "256Mi" }
 ---
 # =================================================================
 # === OpenAPI bridge — READ-ONLY INSTANCE — wave 1
@@ -769,9 +766,6 @@ spec:
             periodSeconds: 2
             timeoutSeconds: 2
             failureThreshold: 60
-          resources:
-            requests: { cpu: "50m", memory: "128Mi" }
-            limits:   { cpu: "500m", memory: "512Mi" }
           volumeMounts:
             - name: kube
               mountPath: /kube
@@ -973,9 +967,6 @@ spec:
             periodSeconds: 2
             timeoutSeconds: 2
             failureThreshold: 60
-          resources:
-            requests: { cpu: "50m", memory: "128Mi" }
-            limits:   { cpu: "500m", memory: "512Mi" }
           volumeMounts:
             - name: kube
               mountPath: /kube
